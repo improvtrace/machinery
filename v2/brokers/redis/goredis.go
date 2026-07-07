@@ -38,45 +38,23 @@ type BrokerGR struct {
 
 // NewGR creates new Broker instance
 func NewGR(cnf *config.Config, addrs []string, db int) iface.Broker {
-	b := &BrokerGR{Broker: common.NewBroker(cnf)}
-
-	var password string
-	var username string
-	parts := strings.Split(addrs[0], "@")
-	if len(parts) >= 2 {
-		// with password
-		options := strings.SplitN(strings.Join(parts[:len(parts)-1], "@"), ":", 2)
-		if len(options) >= 2 {
-			username = options[0]
-			password = options[1]
-		} else {
-			password = options[0]
-		}
-
-		addrs[0] = parts[len(parts)-1] // addr is the last one without @
+	b := &BrokerGR{
+		Broker:  common.NewBroker(cnf),
+		rclient: common.NewGoRedisClient(cnf, addrs, db),
 	}
-
-	ropt := &redis.UniversalOptions{
-		Addrs:    addrs,
-		DB:       db,
-		Password: password,
-		Username: username,
-	}
-	if cnf.Redis != nil {
-		ropt.MasterName = cnf.Redis.MasterName
-	}
-	if cnf.TLSConfig != nil {
-		ropt.TLSConfig = cnf.TLSConfig
-	}
-
-	if cnf.Redis != nil && cnf.Redis.SentinelPassword != "" {
-		ropt.SentinelPassword = cnf.Redis.SentinelPassword
-	}
-
-	if cnf.Redis != nil && cnf.Redis.ClusterEnabled {
-		b.rclient = redis.NewClusterClient(ropt.Cluster())
+	if cnf.Redis != nil && cnf.Redis.DelayedTasksKey != "" {
+		b.redisDelayedTasksKey = cnf.Redis.DelayedTasksKey
 	} else {
-		b.rclient = redis.NewUniversalClient(ropt)
+		b.redisDelayedTasksKey = defaultRedisDelayedTasksKey
+	}
+	return b
+}
+
+// NewGRWithClient creates new Broker instance with an external redis.UniversalClient
+func NewGRWithClient(cnf *config.Config, client redis.UniversalClient) iface.Broker {
+	b := &BrokerGR{
+		Broker:  common.NewBroker(cnf),
+		rclient: client,
 	}
 	if cnf.Redis != nil && cnf.Redis.DelayedTasksKey != "" {
 		b.redisDelayedTasksKey = cnf.Redis.DelayedTasksKey
