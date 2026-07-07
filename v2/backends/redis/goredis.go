@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"strings"
 	"sync"
 	"time"
 
@@ -36,47 +35,19 @@ type BackendGR struct {
 func NewGR(cnf *config.Config, addrs []string, db int) iface.Backend {
 	b := &BackendGR{
 		Backend: common.NewBackend(cnf),
-	}
-	var password string
-	var username string
-	parts := strings.Split(addrs[0], "@")
-	if len(parts) >= 2 {
-		// with password
-		options := strings.SplitN(strings.Join(parts[:len(parts)-1], "@"), ":", 2)
-		if len(options) >= 2 {
-			username = options[0]
-			password = options[1]
-		} else {
-			password = options[0]
-		}
-
-		addrs[0] = parts[len(parts)-1] // addr is the last one without @
-	}
-
-	ropt := &redis.UniversalOptions{
-		Addrs:    addrs,
-		DB:       db,
-		Username: username,
-		Password: password,
-	}
-	if cnf.Redis != nil {
-		ropt.MasterName = cnf.Redis.MasterName
-	}
-	if cnf.TLSConfig != nil {
-		ropt.TLSConfig = cnf.TLSConfig
-	}
-
-	if cnf.Redis != nil && cnf.Redis.SentinelPassword != "" {
-		ropt.SentinelPassword = cnf.Redis.SentinelPassword
-	}
-
-	if cnf.Redis != nil && cnf.Redis.ClusterEnabled {
-		b.rclient = redis.NewClusterClient(ropt.Cluster())
-	} else {
-		b.rclient = redis.NewUniversalClient(ropt)
+		rclient: common.NewGoRedisClient(cnf, addrs, db),
 	}
 	b.redsync = redsync.New(redsyncgoredis.NewPool(b.rclient))
 	return b
+}
+
+// NewGRWithClient creates Backend instance with an external redis.UniversalClient
+func NewGRWithClient(cnf *config.Config, client redis.UniversalClient) iface.Backend {
+	return &BackendGR{
+		Backend: common.NewBackend(cnf),
+		rclient: client,
+		redsync: redsync.New(redsyncgoredis.NewPool(client)),
+	}
 }
 
 // InitGroup creates and saves a group meta data object
