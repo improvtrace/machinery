@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"time"
@@ -17,23 +18,23 @@ import (
 // Backend - a common interface for all result backends
 type Backend interface {
 	// Group related functions
-	InitGroup(groupUUID string, taskUUIDs []string) error
-	GroupCompleted(groupUUID string, groupTaskCount int) (bool, error)
-	GroupTaskStates(groupUUID string, groupTaskCount int) ([]*TaskState, error)
-	TriggerChord(groupUUID string) (bool, error)
+	InitGroup(ctx context.Context, groupUUID string, taskUUIDs []string) error
+	GroupCompleted(ctx context.Context, groupUUID string, groupTaskCount int) (bool, error)
+	GroupTaskStates(ctx context.Context, groupUUID string, groupTaskCount int) ([]*TaskState, error)
+	TriggerChord(ctx context.Context, groupUUID string) (bool, error)
 
 	// Setting / getting task state
-	SetStatePending(signature *Signature) error
-	SetStateReceived(signature *Signature) error
-	SetStateStarted(signature *Signature) error
-	SetStateRetry(signature *Signature) error
-	SetStateSuccess(signature *Signature, results []*TaskResult) error
-	SetStateFailure(signature *Signature, err string) error
-	GetState(taskUUID string) (*TaskState, error)
+	SetStatePending(ctx context.Context, signature *Signature) error
+	SetStateReceived(ctx context.Context, signature *Signature) error
+	SetStateStarted(ctx context.Context, signature *Signature) error
+	SetStateRetry(ctx context.Context, signature *Signature) error
+	SetStateSuccess(ctx context.Context, signature *Signature, results []*TaskResult) error
+	SetStateFailure(ctx context.Context, signature *Signature, err string) error
+	GetState(ctx context.Context, taskUUID string) (*TaskState, error)
 
 	// Purging stored task states and group meta data
-	PurgeState(taskUUID string) error
-	PurgeGroupMeta(groupUUID string) error
+	PurgeState(ctx context.Context, taskUUID string) error
+	PurgeGroupMeta(ctx context.Context, groupUUID string) error
 }
 
 // BaseBackend represents a base backend structure
@@ -69,7 +70,7 @@ func NewRedisBackendWithClient(cnf *Config, client redis.UniversalClient) Backen
 }
 
 // InitGroup creates and saves a group meta data object
-func (b *RedisBackend) InitGroup(groupUUID string, taskUUIDs []string) error {
+func (b *RedisBackend) InitGroup(ctx context.Context, groupUUID string, taskUUIDs []string) error {
 	groupMeta := &GroupMeta{
 		GroupUUID: groupUUID,
 		TaskUUIDs: taskUUIDs,
@@ -82,7 +83,7 @@ func (b *RedisBackend) InitGroup(groupUUID string, taskUUIDs []string) error {
 	}
 
 	expiration := b.getExpiration()
-	err = b.rclient.Set(context.Background(), groupUUID, encoded, expiration).Err()
+	err = b.rclient.Set(ctx, groupUUID, encoded, expiration).Err()
 	if err != nil {
 		return err
 	}
@@ -91,13 +92,13 @@ func (b *RedisBackend) InitGroup(groupUUID string, taskUUIDs []string) error {
 }
 
 // GroupCompleted returns true if all tasks in a group finished
-func (b *RedisBackend) GroupCompleted(groupUUID string, groupTaskCount int) (bool, error) {
-	groupMeta, err := b.getGroupMeta(groupUUID)
+func (b *RedisBackend) GroupCompleted(ctx context.Context, groupUUID string, groupTaskCount int) (bool, error) {
+	groupMeta, err := b.getGroupMeta(ctx, groupUUID)
 	if err != nil {
 		return false, err
 	}
 
-	taskStates, err := b.getStates(groupMeta.TaskUUIDs...)
+	taskStates, err := b.getStates(ctx, groupMeta.TaskUUIDs...)
 	if err != nil {
 		return false, err
 	}
@@ -113,27 +114,33 @@ func (b *RedisBackend) GroupCompleted(groupUUID string, groupTaskCount int) (boo
 }
 
 // GroupTaskStates returns states of all tasks in the group
-func (b *RedisBackend) GroupTaskStates(groupUUID string, groupTaskCount int) ([]*TaskState, error) {
-	groupMeta, err := b.getGroupMeta(groupUUID)
+func (b *RedisBackend) GroupTaskStates(ctx context.Context, groupUUID string, groupTaskCount int) ([]*TaskState, error) {
+	groupMeta, err := b.getGroupMeta(ctx, groupUUID)
 	if err != nil {
 		return []*TaskState{}, err
 	}
 
-	return b.getStates(groupMeta.TaskUUIDs...)
+	return b.getStates(ctx, groupMeta.TaskUUIDs...)
 }
 
 // TriggerChord flags chord as triggered in the backend storage to make sure
 // chord is never triggered multiple times. Returns a boolean flag to indicate
 // whether the worker should trigger chord (true) or no if it has been triggered
 // already (false)
-func (b *RedisBackend) TriggerChord(groupUUID string) (bool, error) {
-	m := b.redsync.NewMutex("TriggerChordMutex")
+func (b *RedisBackend) TriggerChord(ctx context.Context, groupUUID string) (bool, error) {
+	// per-group key: a single global name serializes every chord trigger of
+	// every group (and every instance sharing the same Redis) on one lock
+	m := b.redsync.NewMutex(fmt.Sprintf("TriggerChordMutex-%s", groupUUID))
 	if err := m.Lock(); err != nil {
 		return false, err
 	}
-	defer m.Unlock()
+	defer func() {
+		if _, err := m.Unlock(); err != nil {
+			slog.Warn("failed to unlock chord mutex", "group", groupUUID, "error", err)
+		}
+	}()
 
-	groupMeta, err := b.getGroupMeta(groupUUID)
+	groupMeta, err := b.getGroupMeta(ctx, groupUUID)
 	if err != nil {
 		return false, err
 	}
@@ -153,7 +160,7 @@ func (b *RedisBackend) TriggerChord(groupUUID string) (bool, error) {
 	}
 
 	expiration := b.getExpiration()
-	err = b.rclient.Set(context.Background(), groupUUID, encoded, expiration).Err()
+	err = b.rclient.Set(ctx, groupUUID, encoded, expiration).Err()
 	if err != nil {
 		return false, err
 	}
@@ -161,59 +168,77 @@ func (b *RedisBackend) TriggerChord(groupUUID string) (bool, error) {
 	return true, nil
 }
 
-func (b *RedisBackend) mergeNewTaskState(newState *TaskState) {
-	state, err := b.GetState(newState.TaskUUID)
-	if err == nil {
-		newState.CreatedAt = state.CreatedAt
-		newState.TaskName = state.TaskName
+func (b *RedisBackend) mergeNewTaskState(ctx context.Context, newState *TaskState) error {
+	state, err := b.GetState(ctx, newState.TaskUUID)
+	if err != nil {
+		// no prior state stored yet — nothing to merge, that's expected for
+		// a fresh task; any other error must not silently drop
+		// CreatedAt/TaskName from the state we are about to persist
+		if errors.Is(err, redis.Nil) {
+			return nil
+		}
+		return err
 	}
+	newState.CreatedAt = state.CreatedAt
+	newState.TaskName = state.TaskName
+	return nil
 }
 
 // SetStatePending updates task state to PENDING
-func (b *RedisBackend) SetStatePending(signature *Signature) error {
+func (b *RedisBackend) SetStatePending(ctx context.Context, signature *Signature) error {
 	taskState := NewPendingTaskState(signature)
-	return b.updateState(taskState)
+	return b.updateState(ctx, taskState)
 }
 
 // SetStateReceived updates task state to RECEIVED
-func (b *RedisBackend) SetStateReceived(signature *Signature) error {
+func (b *RedisBackend) SetStateReceived(ctx context.Context, signature *Signature) error {
 	taskState := NewReceivedTaskState(signature)
-	b.mergeNewTaskState(taskState)
-	return b.updateState(taskState)
+	if err := b.mergeNewTaskState(ctx, taskState); err != nil {
+		return err
+	}
+	return b.updateState(ctx, taskState)
 }
 
 // SetStateStarted updates task state to STARTED
-func (b *RedisBackend) SetStateStarted(signature *Signature) error {
+func (b *RedisBackend) SetStateStarted(ctx context.Context, signature *Signature) error {
 	taskState := NewStartedTaskState(signature)
-	b.mergeNewTaskState(taskState)
-	return b.updateState(taskState)
+	if err := b.mergeNewTaskState(ctx, taskState); err != nil {
+		return err
+	}
+	return b.updateState(ctx, taskState)
 }
 
 // SetStateRetry updates task state to RETRY
-func (b *RedisBackend) SetStateRetry(signature *Signature) error {
+func (b *RedisBackend) SetStateRetry(ctx context.Context, signature *Signature) error {
 	taskState := NewRetryTaskState(signature)
-	b.mergeNewTaskState(taskState)
-	return b.updateState(taskState)
+	if err := b.mergeNewTaskState(ctx, taskState); err != nil {
+		return err
+	}
+	return b.updateState(ctx, taskState)
 }
 
 // SetStateSuccess updates task state to SUCCESS
-func (b *RedisBackend) SetStateSuccess(signature *Signature, results []*TaskResult) error {
+func (b *RedisBackend) SetStateSuccess(ctx context.Context, signature *Signature, results []*TaskResult) error {
 	taskState := NewSuccessTaskState(signature, results)
-	b.mergeNewTaskState(taskState)
-	return b.updateState(taskState)
+	if err := b.mergeNewTaskState(ctx, taskState); err != nil {
+		return err
+	}
+	return b.updateState(ctx, taskState)
 }
 
 // SetStateFailure updates task state to FAILURE
-func (b *RedisBackend) SetStateFailure(signature *Signature, err string) error {
+func (b *RedisBackend) SetStateFailure(ctx context.Context, signature *Signature, err string) error {
 	taskState := NewFailureTaskState(signature, err)
-	b.mergeNewTaskState(taskState)
-	return b.updateState(taskState)
+	if err := b.mergeNewTaskState(ctx, taskState); err != nil {
+		return err
+	}
+	return b.updateState(ctx, taskState)
 }
 
 // GetState returns the latest task state
-func (b *RedisBackend) GetState(taskUUID string) (*TaskState, error) {
+func (b *RedisBackend) GetState(ctx context.Context, taskUUID string) (*TaskState, error) {
 
-	item, err := b.rclient.Get(context.Background(), taskUUID).Bytes()
+	item, err := b.rclient.Get(ctx, taskUUID).Bytes()
 	if err != nil {
 		return nil, err
 	}
@@ -228,8 +253,8 @@ func (b *RedisBackend) GetState(taskUUID string) (*TaskState, error) {
 }
 
 // PurgeState deletes stored task state
-func (b *RedisBackend) PurgeState(taskUUID string) error {
-	err := b.rclient.Del(context.Background(), taskUUID).Err()
+func (b *RedisBackend) PurgeState(ctx context.Context, taskUUID string) error {
+	err := b.rclient.Del(ctx, taskUUID).Err()
 	if err != nil {
 		return err
 	}
@@ -238,8 +263,8 @@ func (b *RedisBackend) PurgeState(taskUUID string) error {
 }
 
 // PurgeGroupMeta deletes stored group meta data
-func (b *RedisBackend) PurgeGroupMeta(groupUUID string) error {
-	err := b.rclient.Del(context.Background(), groupUUID).Err()
+func (b *RedisBackend) PurgeGroupMeta(ctx context.Context, groupUUID string) error {
+	err := b.rclient.Del(ctx, groupUUID).Err()
 	if err != nil {
 		return err
 	}
@@ -248,8 +273,8 @@ func (b *RedisBackend) PurgeGroupMeta(groupUUID string) error {
 }
 
 // getGroupMeta retrieves group meta data, convenience function to avoid repetition
-func (b *RedisBackend) getGroupMeta(groupUUID string) (*GroupMeta, error) {
-	item, err := b.rclient.Get(context.Background(), groupUUID).Bytes()
+func (b *RedisBackend) getGroupMeta(ctx context.Context, groupUUID string) (*GroupMeta, error) {
+	item, err := b.rclient.Get(ctx, groupUUID).Bytes()
 	if err != nil {
 		return nil, err
 	}
@@ -265,12 +290,12 @@ func (b *RedisBackend) getGroupMeta(groupUUID string) (*GroupMeta, error) {
 }
 
 // getStates returns multiple task states
-func (b *RedisBackend) getStates(taskUUIDs ...string) ([]*TaskState, error) {
+func (b *RedisBackend) getStates(ctx context.Context, taskUUIDs ...string) ([]*TaskState, error) {
 	taskStates := make([]*TaskState, len(taskUUIDs))
 	// to avoid CROSSSLOT error, use pipeline
-	cmders, err := b.rclient.Pipelined(context.Background(), func(pipeliner redis.Pipeliner) error {
+	cmders, err := b.rclient.Pipelined(ctx, func(pipeliner redis.Pipeliner) error {
 		for _, uuid := range taskUUIDs {
-			pipeliner.Get(context.Background(), uuid)
+			pipeliner.Get(ctx, uuid)
 		}
 		return nil
 	})
@@ -296,14 +321,14 @@ func (b *RedisBackend) getStates(taskUUIDs ...string) ([]*TaskState, error) {
 }
 
 // updateState saves current task state
-func (b *RedisBackend) updateState(taskState *TaskState) error {
+func (b *RedisBackend) updateState(ctx context.Context, taskState *TaskState) error {
 	encoded, err := json.Marshal(taskState)
 	if err != nil {
 		return err
 	}
 
 	expiration := b.getExpiration()
-	_, err = b.rclient.Set(context.Background(), taskState.TaskUUID, encoded, expiration).Result()
+	_, err = b.rclient.Set(ctx, taskState.TaskUUID, encoded, expiration).Result()
 	if err != nil {
 		return err
 	}
@@ -334,6 +359,10 @@ type AsyncResult struct {
 	Signature *Signature
 	taskState *TaskState
 	backend   Backend
+	// lastErr holds the last non-transient backend error (anything other
+	// than redis.Nil) so polling loops can surface it instead of treating
+	// a failing backend as "still pending" and polling forever
+	lastErr error
 }
 
 // ChordAsyncResult represents a result of a chord
@@ -383,16 +412,43 @@ func NewChainAsyncResult(tasks []*Signature, backend Backend) *ChainAsyncResult 
 	}
 }
 
+// defaultPollSleep is used when a caller passes a non-positive sleep duration,
+// which would otherwise turn the polling loops below into a busy loop
+// hammering the backend
+const defaultPollSleep = time.Second
+
+// TaskFailedError is returned by Touch/Get when the task finished in the
+// FAILURE state. It is a typed error so callers can distinguish "the task
+// itself failed" from transport/backend problems via errors.As.
+type TaskFailedError struct {
+	TaskUUID string
+	Message  string
+}
+
+// Error implements the error interface
+func (e *TaskFailedError) Error() string {
+	return fmt.Sprintf("task %s failed: %s", e.TaskUUID, e.Message)
+}
+
 // Touch the state and don't wait
-func (asyncResult *AsyncResult) Touch() ([]reflect.Value, error) {
+func (asyncResult *AsyncResult) Touch(ctx context.Context) ([]reflect.Value, error) {
 	if asyncResult.backend == nil {
 		return nil, ErrBackendNotConfigured
 	}
 
-	asyncResult.GetState()
+	asyncResult.GetState(ctx)
+
+	// surface backend failures (connection errors, decode errors, ...)
+	// instead of reporting "still pending" forever
+	if asyncResult.lastErr != nil {
+		return nil, asyncResult.lastErr
+	}
 
 	if asyncResult.taskState.IsFailure() {
-		return nil, errors.New(asyncResult.taskState.Error)
+		return nil, &TaskFailedError{
+			TaskUUID: asyncResult.Signature.UUID,
+			Message:  asyncResult.taskState.Error,
+		}
 	}
 
 	if asyncResult.taskState.IsSuccess() {
@@ -402,13 +458,26 @@ func (asyncResult *AsyncResult) Touch() ([]reflect.Value, error) {
 	return nil, nil
 }
 
-// Get returns task results (synchronous blocking call)
-func (asyncResult *AsyncResult) Get(sleepDuration time.Duration) ([]reflect.Value, error) {
+// Get returns task results when they arrive, or ctx.Err() if the context is
+// cancelled first (synchronous blocking call)
+func (asyncResult *AsyncResult) Get(ctx context.Context, sleepDuration time.Duration) ([]reflect.Value, error) {
+	if sleepDuration <= 0 {
+		sleepDuration = defaultPollSleep
+	}
 	for {
-		results, err := asyncResult.Touch()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 
+		results, err := asyncResult.Touch(ctx)
 		if results == nil && err == nil {
-			time.Sleep(sleepDuration)
+			timer := time.NewTimer(sleepDuration)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
 		} else {
 			return results, err
 		}
@@ -416,42 +485,48 @@ func (asyncResult *AsyncResult) Get(sleepDuration time.Duration) ([]reflect.Valu
 }
 
 // GetWithTimeout returns task results with a timeout (synchronous blocking call)
-func (asyncResult *AsyncResult) GetWithTimeout(timeoutDuration, sleepDuration time.Duration) ([]reflect.Value, error) {
-	timeout := time.NewTimer(timeoutDuration)
-	defer timeout.Stop()
+func (asyncResult *AsyncResult) GetWithTimeout(ctx context.Context, timeoutDuration, sleepDuration time.Duration) ([]reflect.Value, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeoutDuration)
+	defer cancel()
 
-	for {
-		select {
-		case <-timeout.C:
-			return nil, ErrTimeoutReached
-		default:
-			results, err := asyncResult.Touch()
-
-			if results == nil && err == nil {
-				time.Sleep(sleepDuration)
-			} else {
-				return results, err
-			}
-		}
+	results, err := asyncResult.Get(ctx, sleepDuration)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return nil, ErrTimeoutReached
 	}
+	return results, err
 }
 
 // GetState returns latest task state
-func (asyncResult *AsyncResult) GetState() *TaskState {
+func (asyncResult *AsyncResult) GetState(ctx context.Context) *TaskState {
+	if asyncResult.backend == nil {
+		// guard against a nil backend, matching Touch's ErrBackendNotConfigured
+		// behavior (Touch calls this method, so no error return here)
+		return asyncResult.taskState
+	}
+
 	if asyncResult.taskState.IsCompleted() {
 		return asyncResult.taskState
 	}
 
-	taskState, err := asyncResult.backend.GetState(asyncResult.Signature.UUID)
-	if err == nil {
-		asyncResult.taskState = taskState
+	taskState, err := asyncResult.backend.GetState(ctx, asyncResult.Signature.UUID)
+	if err != nil {
+		// redis.Nil simply means the state isn't stored yet — keep polling;
+		// any other error is remembered and surfaced by Touch
+		if !errors.Is(err, redis.Nil) {
+			asyncResult.lastErr = err
+		}
+		return asyncResult.taskState
 	}
+
+	asyncResult.lastErr = nil
+	asyncResult.taskState = taskState
 
 	return asyncResult.taskState
 }
 
-// Get returns results of a chain of tasks (synchronous blocking call)
-func (chainAsyncResult *ChainAsyncResult) Get(sleepDuration time.Duration) ([]reflect.Value, error) {
+// Get returns results of a chain of tasks once every task has finished
+// (synchronous blocking call)
+func (chainAsyncResult *ChainAsyncResult) Get(ctx context.Context, sleepDuration time.Duration) ([]reflect.Value, error) {
 	if chainAsyncResult.backend == nil {
 		return nil, ErrBackendNotConfigured
 	}
@@ -462,7 +537,7 @@ func (chainAsyncResult *ChainAsyncResult) Get(sleepDuration time.Duration) ([]re
 	)
 
 	for _, asyncResult := range chainAsyncResult.asyncResults {
-		results, err = asyncResult.Get(sleepDuration)
+		results, err = asyncResult.Get(ctx, sleepDuration)
 		if err != nil {
 			return nil, err
 		}
@@ -471,97 +546,55 @@ func (chainAsyncResult *ChainAsyncResult) Get(sleepDuration time.Duration) ([]re
 	return results, err
 }
 
-// Get returns result of a chord (synchronous blocking call)
-func (chordAsyncResult *ChordAsyncResult) Get(sleepDuration time.Duration) ([]reflect.Value, error) {
+// Get returns result of a chord once every group task and the callback have
+// finished (synchronous blocking call)
+func (chordAsyncResult *ChordAsyncResult) Get(ctx context.Context, sleepDuration time.Duration) ([]reflect.Value, error) {
 	if chordAsyncResult.backend == nil {
 		return nil, ErrBackendNotConfigured
 	}
 
-	var err error
 	for _, asyncResult := range chordAsyncResult.groupAsyncResults {
-		_, err = asyncResult.Get(sleepDuration)
-		if err != nil {
+		if _, err := asyncResult.Get(ctx, sleepDuration); err != nil {
 			return nil, err
 		}
 	}
 
-	return chordAsyncResult.chordAsyncResult.Get(sleepDuration)
+	return chordAsyncResult.chordAsyncResult.Get(ctx, sleepDuration)
 }
 
 // GetWithTimeout returns results of a chain of tasks with timeout (synchronous blocking call)
-func (chainAsyncResult *ChainAsyncResult) GetWithTimeout(timeoutDuration, sleepDuration time.Duration) ([]reflect.Value, error) {
+func (chainAsyncResult *ChainAsyncResult) GetWithTimeout(ctx context.Context, timeoutDuration, sleepDuration time.Duration) ([]reflect.Value, error) {
 	if chainAsyncResult.backend == nil {
 		return nil, ErrBackendNotConfigured
 	}
 
-	var (
-		results []reflect.Value
-		err     error
-	)
-
-	timeout := time.NewTimer(timeoutDuration)
-	defer timeout.Stop()
-	ln := len(chainAsyncResult.asyncResults)
-	lastResult := chainAsyncResult.asyncResults[ln-1]
-
-	for {
-		select {
-		case <-timeout.C:
-			return nil, ErrTimeoutReached
-		default:
-
-			for _, asyncResult := range chainAsyncResult.asyncResults {
-				_, err = asyncResult.Touch()
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			results, err = lastResult.Touch()
-			if err != nil {
-				return nil, err
-			}
-			if results != nil {
-				return results, err
-			}
-			time.Sleep(sleepDuration)
-		}
+	// an empty chain has nothing to wait for
+	if len(chainAsyncResult.asyncResults) == 0 {
+		return nil, nil
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeoutDuration)
+	defer cancel()
+
+	results, err := chainAsyncResult.Get(ctx, sleepDuration)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return nil, ErrTimeoutReached
+	}
+	return results, err
 }
 
 // GetWithTimeout returns result of a chord with a timeout (synchronous blocking call)
-func (chordAsyncResult *ChordAsyncResult) GetWithTimeout(timeoutDuration, sleepDuration time.Duration) ([]reflect.Value, error) {
+func (chordAsyncResult *ChordAsyncResult) GetWithTimeout(ctx context.Context, timeoutDuration, sleepDuration time.Duration) ([]reflect.Value, error) {
 	if chordAsyncResult.backend == nil {
 		return nil, ErrBackendNotConfigured
 	}
 
-	var (
-		results []reflect.Value
-		err     error
-	)
+	ctx, cancel := context.WithTimeout(ctx, timeoutDuration)
+	defer cancel()
 
-	timeout := time.NewTimer(timeoutDuration)
-	defer timeout.Stop()
-	for {
-		select {
-		case <-timeout.C:
-			return nil, ErrTimeoutReached
-		default:
-			for _, asyncResult := range chordAsyncResult.groupAsyncResults {
-				_, errcur := asyncResult.Touch()
-				if errcur != nil {
-					return nil, errcur
-				}
-			}
-
-			results, err = chordAsyncResult.chordAsyncResult.Touch()
-			if err != nil {
-				return nil, err
-			}
-			if results != nil {
-				return results, err
-			}
-			time.Sleep(sleepDuration)
-		}
+	results, err := chordAsyncResult.Get(ctx, sleepDuration)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return nil, ErrTimeoutReached
 	}
+	return results, err
 }

@@ -4,20 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-
-	"github.com/redis/go-redis/v9"
-	goredis "github.com/redis/go-redis/v9"
-
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/go-redsync/redsync/v4"
+	redsyncgoredis "github.com/go-redsync/redsync/v4/redis/goredis/v9"
+	"github.com/redis/go-redis/v9"
 )
 
 // NewGoRedisClient builds a redis.UniversalClient (single node, Sentinel failover
 // or cluster, depending on config) for injection into NewRedisBrokerWithClient,
 // NewRedisBackendWithClient or NewRedisLockWithClient.
 // It parses username/password from the first address if present (format: user:password@host).
-func NewGoRedisClient(cnf *Config, addrs []string, db int) goredis.UniversalClient {
+// Returns nil when addrs is empty; callers must treat a nil client as invalid input.
+func NewGoRedisClient(cnf *Config, addrs []string, db int) redis.UniversalClient {
 	if len(addrs) == 0 {
 		return nil
 	}
@@ -37,7 +37,7 @@ func NewGoRedisClient(cnf *Config, addrs []string, db int) goredis.UniversalClie
 		addrs[0] = parts[len(parts)-1]
 	}
 
-	ropt := &goredis.UniversalOptions{
+	ropt := &redis.UniversalOptions{
 		Addrs:    addrs,
 		DB:       db,
 		Username: username,
@@ -54,21 +54,21 @@ func NewGoRedisClient(cnf *Config, addrs []string, db int) goredis.UniversalClie
 	}
 
 	if cnf.Redis != nil && cnf.Redis.ClusterEnabled {
-		return goredis.NewClusterClient(ropt.Cluster())
+		return redis.NewClusterClient(ropt.Cluster())
 	}
-	return goredis.NewUniversalClient(ropt)
+	return redis.NewUniversalClient(ropt)
 }
 
 type Lock interface {
-	//Acquire the lock with retry
+	//Acquire the lock, retrying up to the configured number of times.
 	//key: the name of the lock,
-	//value: at the nanosecond timestamp that lock needs to be released automatically
-	LockWithRetries(key string, value int64) error
+	//ttl: how long the lock is held; passing a non-positive ttl is an error
+	LockWithRetries(ctx context.Context, key string, ttl time.Duration) error
 
-	//Acquire the lock with once
+	//Acquire the lock with a single attempt.
 	//key: the name of the lock,
-	//value: at the nanosecond timestamp that lock needs to be released automatically
-	Lock(key string, value int64) error
+	//ttl: how long the lock is held; passing a non-positive ttl is an error
+	Lock(ctx context.Context, key string, ttl time.Duration) error
 }
 
 var (
@@ -78,95 +78,78 @@ var (
 // defaultLockRetryInterval is the sleep between lock acquisition attempts.
 const defaultLockRetryInterval = 500 * time.Millisecond
 
+// RedisLock is a distributed lock backed by redsync (Redlock) — the same
+// implementation the backend uses for its TriggerChord mutex. The lock is held
+// for the given TTL and auto-expires afterwards, so a crashed holder never
+// deadlocks the schedule.
 type RedisLock struct {
-	rclient  redis.UniversalClient
+	rsync    *redsync.Redsync
 	retries  int
 	interval time.Duration
 }
 
-func NewRedisLock(cnf *Config, addrs []string, db, retries int) RedisLock {
-	if retries < 1 {
-		retries = 1
-	}
-	return RedisLock{
-		rclient:  NewGoRedisClient(cnf, addrs, db),
-		retries:  retries,
-		interval: defaultLockRetryInterval,
-	}
-}
-
+// NewRedisLockWithClient creates a RedisLock with an externally owned
+// redis.UniversalClient. The caller owns the client lifecycle.
 func NewRedisLockWithClient(client redis.UniversalClient, retries int) RedisLock {
 	if retries < 1 {
 		retries = 1
 	}
-	return RedisLock{
-		rclient:  client,
+	l := RedisLock{
 		retries:  retries,
 		interval: defaultLockRetryInterval,
 	}
+	if client != nil {
+		l.rsync = redsync.New(redsyncgoredis.NewPool(client))
+	}
+	return l
 }
 
-func (r RedisLock) LockWithRetries(key string, unixTsToExpireNs int64) error {
+func (r RedisLock) LockWithRetries(ctx context.Context, key string, ttl time.Duration) error {
 	var lastErr error
 	for i := 0; i <= r.retries; i++ {
-		err := r.Lock(key, unixTsToExpireNs)
+		err := r.Lock(ctx, key, ttl)
 		if err == nil {
 			// 成功拿到锁，返回
 			return nil
 		}
 		lastErr = err
 
-		time.Sleep(r.interval)
+		// 最后一次尝试后不再空等一个 interval
+		if i < r.retries {
+			time.Sleep(r.interval)
+		}
 	}
 	// keep ErrRedisLockFailed as the sentinel while preserving the last cause
 	return fmt.Errorf("%w: %w", ErrRedisLockFailed, lastErr)
 }
 
-func (r RedisLock) Lock(key string, unixTsToExpireNs int64) error {
-	now := time.Now().UnixNano()
-	expiration := time.Duration(unixTsToExpireNs + 1 - now)
-	ctx := context.Background()
+func (r RedisLock) Lock(ctx context.Context, key string, ttl time.Duration) error {
+	if r.rsync == nil {
+		// a nil client would panic inside go-redis; fail with a domain error
+		// instead (mirrors the nil-client guard the hand-rolled lock had)
+		return fmt.Errorf("%w: redis client is nil", ErrRedisLockFailed)
+	}
+	if ttl <= 0 {
+		// a non-positive ttl cannot express "hold until ..."; require a real
+		// duration so the key always carries an expiry
+		return fmt.Errorf("%w: lock ttl must be positive", ErrRedisLockFailed)
+	}
 
-	success, err := r.rclient.SetNX(ctx, key, unixTsToExpireNs, expiration).Result()
-	if err != nil {
+	// single attempt here; retrying is LockWithRetries' job
+	m := r.rsync.NewMutex(key,
+		redsync.WithExpiry(ttl),
+		redsync.WithTries(1),
+	)
+	if err := m.Lock(); err != nil {
+		// redsync.ErrFailed means someone else holds the lock: report the
+		// domain sentinel instead of leaking the implementation error
+		if errors.Is(err, redsync.ErrFailed) {
+			return ErrRedisLockFailed
+		}
 		return err
 	}
 
-	if !success {
-		v, err := r.rclient.Get(ctx, key).Result()
-		if err != nil {
-			return err
-		}
-		timeout, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			return err
-		}
-
-		if timeout != 0 && now > timeout {
-			newTimeout, err := r.rclient.GetSet(ctx, key, unixTsToExpireNs).Result()
-			if err != nil {
-				return err
-			}
-
-			curTimeout, err := strconv.ParseInt(newTimeout, 10, 64)
-			if err != nil {
-				return err
-			}
-
-			if now > curTimeout {
-				// success to acquire lock with get set
-				// set the expiration of redis key
-				if err := r.rclient.Expire(ctx, key, expiration).Err(); err != nil {
-					return err
-				}
-				return nil
-			}
-
-			return ErrRedisLockFailed
-		}
-
-		return ErrRedisLockFailed
-	}
-
+	// intentionally not unlocking: the lock must survive for the whole TTL so
+	// the same schedule slot cannot fire twice; it auto-expires afterwards
 	return nil
 }

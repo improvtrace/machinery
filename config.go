@@ -12,9 +12,13 @@ const (
 // Config holds all configuration for a machinery server. Construct it in code
 // and pass it to NewServer together with a broker, a backend and a lock.
 type Config struct {
-	Broker          string
+	// AppName namespaces the periodic-task lock keys (DefaultQueue is the
+	// redis queue, AppName identifies the deploying application). Defaults
+	// to the binary name when empty.
+	AppName string
+	// DefaultQueue is the redis list tasks are published to when no custom
+	// queue is set. Required.
 	DefaultQueue    string
-	ResultBackend   string
 	ResultsExpireIn int
 	Redis           *RedisConfig
 	TLSConfig       *tls.Config

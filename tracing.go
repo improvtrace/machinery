@@ -2,6 +2,7 @@ package machinery
 
 import (
 	"encoding/json"
+	"fmt"
 
 	opentracing "github.com/opentracing/opentracing-go"
 	opentracing_ext "github.com/opentracing/opentracing-go/ext"
@@ -108,6 +109,10 @@ func AnnotateSpanWithChainInfo(span opentracing.Span, chain *Chain) {
 
 // AnnotateSpanWithGroupInfo tags the span with group workflow details.
 func AnnotateSpanWithGroupInfo(span opentracing.Span, group *Group, sendConcurrency int) {
+	if group == nil {
+		return
+	}
+
 	// tag the span with some info about the group
 	span.SetTag("group.uuid", group.GroupUUID)
 	span.SetTag("group.tasks.length", len(group.Tasks))
@@ -117,7 +122,9 @@ func AnnotateSpanWithGroupInfo(span opentracing.Span, group *Group, sendConcurre
 	if taskUUIDs, err := json.Marshal(group.GetUUIDs()); err == nil {
 		span.SetTag("group.tasks", string(taskUUIDs))
 	} else {
-		span.SetTag("group.tasks", group.GetUUIDs())
+		// tag values must be strings (or basic types); a []string is not a
+		// supported opentracing tag type
+		span.SetTag("group.tasks", fmt.Sprint(group.GetUUIDs()))
 	}
 
 	// inject the tracing span into the tasks signature headers
@@ -128,11 +135,19 @@ func AnnotateSpanWithGroupInfo(span opentracing.Span, group *Group, sendConcurre
 
 // AnnotateSpanWithChordInfo tags the span with chord workflow details.
 func AnnotateSpanWithChordInfo(span opentracing.Span, chord *Chord, sendConcurrency int) {
-	// tag the span with chord specific info
-	span.SetTag("chord.callback.uuid", chord.Callback.UUID)
+	// Chord is exported and callers may pass user-constructed values, e.g.
+	// a chord built without a callback; guard against nil dereferences
+	if chord == nil {
+		return
+	}
 
-	// inject the tracing span into the callback signature
-	chord.Callback.Headers = HeadersWithSpan(chord.Callback.Headers, span)
+	// tag the span with chord specific info
+	if chord.Callback != nil {
+		span.SetTag("chord.callback.uuid", chord.Callback.UUID)
+
+		// inject the tracing span into the callback signature
+		chord.Callback.Headers = HeadersWithSpan(chord.Callback.Headers, span)
+	}
 
 	// tag the span for the group part of the chord
 	AnnotateSpanWithGroupInfo(span, chord.Group, sendConcurrency)

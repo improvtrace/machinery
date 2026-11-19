@@ -1,6 +1,7 @@
 package machinery
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -52,6 +53,13 @@ func SignatureFromContext(ctx context.Context) *Signature {
 
 // NewWithSignature is the same as New but injects the signature
 func NewWithSignature(taskFunc any, signature *Signature) (*Task, error) {
+	if signature == nil {
+		return nil, ErrInvalidArgument
+	}
+	if reflect.ValueOf(taskFunc).Kind() != reflect.Func {
+		return nil, ErrTaskMustBeFunc
+	}
+
 	args := signature.Args
 	ctx := context.Background()
 	ctx = context.WithValue(ctx, signatureCtx, signature)
@@ -75,9 +83,15 @@ func NewWithSignature(taskFunc any, signature *Signature) (*Task, error) {
 	return task, nil
 }
 
-// New tries to use reflection to convert the function and arguments
+// NewTask tries to use reflection to convert the function and arguments
 // into a reflect.Value and prepare it for invocation
 func NewTask(taskFunc any, args []Arg) (*Task, error) {
+	// reflect.TypeOf(taskFunc).NumIn() below would panic on a nil or
+	// non-func task, so validate the func kind first (nil included)
+	if reflect.ValueOf(taskFunc).Kind() != reflect.Func {
+		return nil, ErrTaskMustBeFunc
+	}
+
 	task := &Task{
 		TaskFunc: reflect.ValueOf(taskFunc),
 		Context:  context.Background(),
@@ -154,14 +168,29 @@ func (t *Task) Call() (taskResults []*TaskResult, err error) {
 	// Last returned value
 	lastResult := results[len(results)-1]
 
+	// IsNil panics for non-nilable kinds (e.g. a struct or int), so only
+	// test nilability for kinds that can hold nil; anything else is treated
+	// as a non-nil return value
+	lastIsNil := false
+	switch lastResult.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		lastIsNil = lastResult.IsNil()
+	}
+
 	// If the last returned value is not nil, it has to be of error type, if that
 	// is not the case, return error message, otherwise propagate the task error
 	// to the caller
-	if !lastResult.IsNil() {
+	if !lastIsNil {
 		// If the result implements Retriable interface, return instance of Retriable
 		retriableErrorInterface := reflect.TypeOf((*Retriable)(nil)).Elem()
 		if lastResult.Type().Implements(retriableErrorInterface) {
-			return nil, lastResult.Interface().(ErrRetryTaskLater)
+			// only the concrete ErrRetryTaskLater carries machinery's retry
+			// semantics; other Retriable implementations fall through to the
+			// standard error handling below instead of panicking on the
+			// unchecked assertion
+			if retriableErr, ok := lastResult.Interface().(ErrRetryTaskLater); ok {
+				return nil, retriableErr
+			}
 		}
 
 		// Otherwise, check that the result implements the standard error interface,
@@ -179,9 +208,13 @@ func (t *Task) Call() (taskResults []*TaskResult, err error) {
 	taskResults = make([]*TaskResult, len(results)-1)
 	for i := 0; i < len(results)-1; i++ {
 		val := results[i].Interface()
-		typeStr := reflect.TypeOf(val).String()
+		valType := reflect.TypeOf(val)
+		if valType == nil {
+			// an untyped nil cannot be serialized into a TaskResult
+			return nil, fmt.Errorf("task returned an untyped nil value at result index %d", i)
+		}
 		taskResults[i] = &TaskResult{
-			Type:  typeStr,
+			Type:  valType.String(),
 			Value: val,
 		}
 	}
@@ -233,8 +266,8 @@ type Retriable interface {
 
 // TaskResult represents an actual return value of a processed task
 type TaskResult struct {
-	Type  string `bson:"type"`
-	Value any    `bson:"value"`
+	Type  string
+	Value any
 }
 
 // ReflectTaskResults converts task results into reflect values.
@@ -266,9 +299,9 @@ func HumanReadableResults(results []reflect.Value) string {
 
 // Arg represents a single argument passed to invocation fo a task
 type Arg struct {
-	Name  string `bson:"name"`
-	Type  string `bson:"type"`
-	Value any    `bson:"value"`
+	Name  string
+	Type  string
+	Value any
 }
 
 // Headers represents the headers which should be used to direct the task
@@ -308,20 +341,12 @@ type Signature struct {
 	GroupTaskCount int
 	Args           []Arg
 	Headers        Headers
-	Priority       uint8
 	Immutable      bool
 	RetryCount     int
 	RetryTimeout   int
 	OnSuccess      []*Signature
 	OnError        []*Signature
 	ChordCallback  *Signature
-	//MessageGroupId for Broker, e.g. SQS
-	BrokerMessageGroupId string
-	//ReceiptHandle of SQS Message
-	SQSReceiptHandle string
-	// StopTaskDeletionOnError used with sqs when we want to send failed messages to dlq,
-	// and don't want machinery to delete from source queue
-	StopTaskDeletionOnError bool
 	// IgnoreWhenTaskNotRegistered auto removes the request when there is no handeler available
 	// When this is true a task with no handler will be ignored and not placed back in the queue
 	IgnoreWhenTaskNotRegistered bool
@@ -345,10 +370,28 @@ func CopySignatures(signatures ...*Signature) []*Signature {
 	return sigs
 }
 
+// CopySignature deep-copies a signature via a JSON round-trip. Decoding with
+// UseNumber keeps every number exact (no float64 conversion), so the copy is
+// lossless for int64/uint64 arguments and immune to the reflection pitfalls
+// (cycles, unexported fields) of the previous reflect-based deep copy.
 func CopySignature(signature *Signature) *Signature {
-	var sig = new(Signature)
-	// DeepCopy cannot fail here: both operands are *Signature, so the error is unreachable.
-	_ = DeepCopy(sig, signature)
+	if signature == nil {
+		return nil
+	}
+	data, err := json.Marshal(signature)
+	if err != nil {
+		// only reachable for arg values that cannot be marshaled; such a
+		// signature would fail to publish anyway
+		slog.Error("failed to copy task signature", "task", signature.UUID, "error", err)
+		return nil
+	}
+	var sig *Signature
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&sig); err != nil {
+		slog.Error("failed to copy task signature", "task", signature.UUID, "error", err)
+		return nil
+	}
 	return sig
 }
 
@@ -369,25 +412,22 @@ const (
 
 // TaskState represents a state of a task
 type TaskState struct {
-	TaskUUID  string        `bson:"_id"`
-	TaskName  string        `bson:"task_name"`
-	State     string        `bson:"state"`
-	Results   []*TaskResult `bson:"results"`
-	Error     string        `bson:"error"`
-	CreatedAt time.Time     `bson:"created_at"`
-	TTL       int64         `bson:"ttl,omitempty"`
+	TaskUUID  string
+	TaskName  string
+	State     string
+	Results   []*TaskResult
+	Error     string
+	CreatedAt time.Time
 }
 
 // GroupMeta stores useful metadata about tasks within the same group
 // E.g. UUIDs of all tasks which are used in order to check if all tasks
 // completed successfully or not and thus whether to trigger chord callback
 type GroupMeta struct {
-	GroupUUID      string    `bson:"_id"`
-	TaskUUIDs      []string  `bson:"task_uuids"`
-	ChordTriggered bool      `bson:"chord_triggered"`
-	Lock           bool      `bson:"lock"`
-	CreatedAt      time.Time `bson:"created_at"`
-	TTL            int64     `bson:"ttl,omitempty"`
+	GroupUUID      string
+	TaskUUIDs      []string
+	ChordTriggered bool
+	CreatedAt      time.Time
 }
 
 // NewPendingTaskState returns a task state set to PENDING.
@@ -486,8 +526,9 @@ func (group *Group) GetUUIDs() []string {
 }
 
 // NewChain creates a new chain of tasks to be processed one by one, passing
-// results unless task signatures are set to be immutable
-func NewChain(signatures ...*Signature) (*Chain, error) {
+// results unless task signatures are set to be immutable.
+// Note: the passed signatures are mutated (UUIDs filled in, OnSuccess wired).
+func NewChain(signatures ...*Signature) *Chain {
 	// Auto generate task UUIDs if needed
 	for _, signature := range signatures {
 		if signature.UUID == "" {
@@ -497,18 +538,15 @@ func NewChain(signatures ...*Signature) (*Chain, error) {
 	}
 
 	for i := len(signatures) - 1; i > 0; i-- {
-		if i > 0 {
-			signatures[i-1].OnSuccess = []*Signature{signatures[i]}
-		}
+		signatures[i-1].OnSuccess = []*Signature{signatures[i]}
 	}
 
-	chain := &Chain{Tasks: signatures}
-
-	return chain, nil
+	return &Chain{Tasks: signatures}
 }
 
-// NewGroup creates a new group of tasks to be processed in parallel
-func NewGroup(signatures ...*Signature) (*Group, error) {
+// NewGroup creates a new group of tasks to be processed in parallel.
+// Note: the passed signatures are mutated (UUIDs / group fields filled in).
+func NewGroup(signatures ...*Signature) *Group {
 	// Generate a group UUID
 	groupUUID := uuid.New().String()
 	groupID := fmt.Sprintf("group_%v", groupUUID)
@@ -526,12 +564,19 @@ func NewGroup(signatures ...*Signature) (*Group, error) {
 	return &Group{
 		GroupUUID: groupID,
 		Tasks:     signatures,
-	}, nil
+	}
 }
 
 // NewChord creates a new chord (a group of tasks with a single callback
 // to be executed after all tasks in the group has completed)
 func NewChord(group *Group, callback *Signature) (*Chord, error) {
+	if group == nil {
+		return nil, errors.New("chord group must not be nil")
+	}
+	if callback == nil {
+		return nil, errors.New("chord callback must not be nil")
+	}
+
 	if callback.UUID == "" {
 		// Generate a UUID for the chord callback
 		callbackUUID := uuid.New().String()
@@ -675,8 +720,14 @@ func reflectValue(valueType string, value any) (reflect.Value, error) {
 			return reflect.Value{}, err
 		}
 
+		// reject values that don't fit the target type (e.g. 300 into int8)
+		// instead of silently truncating them
+		if theValue.Elem().OverflowInt(intValue) {
+			return reflect.Value{}, typeConversionError(value, theType.String())
+		}
+
 		theValue.Elem().SetInt(intValue)
-		return theValue.Elem(), err
+		return theValue.Elem(), nil
 	}
 
 	// Unsigned integers
@@ -686,8 +737,12 @@ func reflectValue(valueType string, value any) (reflect.Value, error) {
 			return reflect.Value{}, err
 		}
 
+		if theValue.Elem().OverflowUint(uintValue) {
+			return reflect.Value{}, typeConversionError(value, theType.String())
+		}
+
 		theValue.Elem().SetUint(uintValue)
-		return theValue.Elem(), err
+		return theValue.Elem(), nil
 	}
 
 	// Floating point numbers
@@ -697,8 +752,12 @@ func reflectValue(valueType string, value any) (reflect.Value, error) {
 			return reflect.Value{}, err
 		}
 
+		if theValue.Elem().OverflowFloat(floatValue) {
+			return reflect.Value{}, typeConversionError(value, theType.String())
+		}
+
 		theValue.Elem().SetFloat(floatValue)
-		return theValue.Elem(), err
+		return theValue.Elem(), nil
 	}
 
 	// Strings
@@ -726,6 +785,15 @@ func reflectValues(valueType string, value any) (reflect.Value, error) {
 	// For NULL we return an empty slice
 	if value == nil {
 		return reflect.MakeSlice(theType, 0, 0), nil
+	}
+
+	// The conversions below call Len/Index, which panic for other kinds;
+	// string stays allowed because the []byte/[]uint8 branch decodes
+	// base64 from a string
+	switch reflect.ValueOf(value).Kind() {
+	case reflect.Slice, reflect.Array, reflect.String:
+	default:
+		return reflect.Value{}, typeConversionError(value, theType.String())
 	}
 
 	var theValue reflect.Value

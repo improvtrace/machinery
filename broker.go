@@ -14,20 +14,19 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-redsync/redsync/v4"
 	"github.com/redis/go-redis/v9"
 )
 
 // Broker - a common interface for all brokers
 type Broker interface {
 	GetConfig() *Config
-	SetRegisteredTaskNames(names []string)
-	IsTaskRegistered(name string) bool
+	// SetTaskRegisteredFunc wires the lookup used to decide whether an
+	// undeliverable task should be requeued or dropped; it keeps a single
+	// source of truth for task registration (the Server's registry)
+	SetTaskRegisteredFunc(func(name string) bool)
 	StartConsuming(consumerTag string, concurrency int, p TaskProcessor) (bool, error)
 	StopConsuming()
 	Publish(ctx context.Context, task *Signature) error
-	GetPendingTasks(queue string) ([]*Signature, error)
-	GetDelayedTasks() ([]*Signature, error)
 	AdjustRoutingKey(s *Signature)
 }
 
@@ -36,23 +35,23 @@ type Broker interface {
 type TaskProcessor interface {
 	Process(signature *Signature) error
 	CustomQueue() string
-	PreConsumeHandler() bool
-}
-
-type registeredTaskNames struct {
-	sync.RWMutex
-	items []string
 }
 
 // BaseBroker represents a base broker structure
 type BaseBroker struct {
-	cnf                 *Config
-	registeredTaskNames registeredTaskNames
+	cnf *Config
+	// isTaskRegistered is injected by the Server; see SetTaskRegisteredFunc
+	isTaskRegistered func(name string) bool
 	// stopped flips to true in StopConsuming; zero value (false) means the
 	// broker is accepting consumption, so a literal-initialized BaseBroker is
 	// valid without extra setup. Accessed atomically: read from consumer
 	// goroutines, written by StopConsuming.
-	stopped       atomic.Bool
+	stopped atomic.Bool
+	// ctx is cancelled by StopConsuming so in-flight Redis calls (e.g. a
+	// blocking BLPOP in nextTask) abort promptly instead of waiting out the
+	// full poll period during shutdown
+	ctx           context.Context
+	cancel        context.CancelFunc
 	retryFunc     func(chan int)
 	retryStopChan chan int
 	stopChan      chan int
@@ -60,8 +59,11 @@ type BaseBroker struct {
 
 // NewBaseBroker creates new BaseBroker instance
 func NewBaseBroker(cnf *Config) BaseBroker {
+	ctx, cancel := context.WithCancel(context.Background())
 	return BaseBroker{
 		cnf:           cnf,
+		ctx:           ctx,
+		cancel:        cancel,
 		stopChan:      make(chan int),
 		retryStopChan: make(chan int),
 	}
@@ -72,58 +74,25 @@ func (b *BaseBroker) GetConfig() *Config {
 	return b.cnf
 }
 
-// GetRetry reports whether the broker should retry reconnecting after a failure.
-func (b *BaseBroker) GetRetry() bool {
+// SetTaskRegisteredFunc wires the registered-task lookup
+func (b *BaseBroker) SetTaskRegisteredFunc(f func(name string) bool) {
+	b.isTaskRegistered = f
+}
+
+// taskRegistered reports whether the task name is registered; defaults to
+// false when no lookup was wired (all tasks would be requeued)
+func (b *BaseBroker) taskRegistered(name string) bool {
+	return b.isTaskRegistered != nil && b.isTaskRegistered(name)
+}
+
+// retrying reports whether the broker should retry reconnecting after a failure.
+func (b *BaseBroker) retrying() bool {
 	return !b.stopped.Load()
 }
 
-// GetRetryFunc returns the retry closure used to space out reconnection attempts.
-func (b *BaseBroker) GetRetryFunc() func(chan int) {
-	return b.retryFunc
-}
-
-// GetRetryStopChan returns the channel used to abort the retry closure early.
-func (b *BaseBroker) GetRetryStopChan() chan int {
-	return b.retryStopChan
-}
-
-// GetStopChan returns the channel that is closed when consumption stops.
-func (b *BaseBroker) GetStopChan() chan int {
-	return b.stopChan
-}
-
-// Publish places a new message on the default queue
-func (b *BaseBroker) Publish(signature *Signature) error {
+// Publish is only a placeholder; concrete brokers must implement it.
+func (b *BaseBroker) Publish(ctx context.Context, signature *Signature) error {
 	return errors.New("Not implemented")
-}
-
-// SetRegisteredTaskNames sets registered task names
-func (b *BaseBroker) SetRegisteredTaskNames(names []string) {
-	b.registeredTaskNames.Lock()
-	defer b.registeredTaskNames.Unlock()
-	b.registeredTaskNames.items = names
-}
-
-// IsTaskRegistered returns true if the task is registered with this broker
-func (b *BaseBroker) IsTaskRegistered(name string) bool {
-	b.registeredTaskNames.RLock()
-	defer b.registeredTaskNames.RUnlock()
-	for _, registeredTaskName := range b.registeredTaskNames.items {
-		if registeredTaskName == name {
-			return true
-		}
-	}
-	return false
-}
-
-// GetPendingTasks returns a slice of task.Signatures waiting in the queue
-func (b *BaseBroker) GetPendingTasks(queue string) ([]*Signature, error) {
-	return nil, errors.New("Not implemented")
-}
-
-// GetDelayedTasks returns a slice of task.Signatures that are scheduled, but not yet in the queue
-func (b *BaseBroker) GetDelayedTasks() ([]*Signature, error) {
-	return nil, errors.New("Not implemented")
 }
 
 // StartConsuming is a common part of StartConsuming method
@@ -131,30 +100,26 @@ func (b *BaseBroker) StartConsuming(consumerTag string, concurrency int, taskPro
 	if b.retryFunc == nil {
 		b.retryFunc = Closure()
 	}
-
 }
 
 // StopConsuming is a common part of StopConsuming
 func (b *BaseBroker) StopConsuming() {
-	// Do not retry from now on
-	b.stopped.Store(true)
+	// Do not retry from now on; the CAS also makes StopConsuming idempotent —
+	// a second close of stopChan would panic ("close of closed channel")
+	if !b.stopped.CompareAndSwap(false, true) {
+		return
+	}
 	// Stop the retry closure earlier
 	select {
 	case b.retryStopChan <- 1:
 		slog.Warn("stopping retry closure")
 	default:
 	}
-	// Notifying the stop channel stops consuming of messages
+	// Cancel in-flight Redis calls first so blocked BLPOPs return promptly,
+	// then close the stop channel which terminates the consuming goroutines
+	b.cancel()
 	close(b.stopChan)
 	slog.Warn("stop channel closed")
-}
-
-// GetRegisteredTaskNames returns registered tasks names
-func (b *BaseBroker) GetRegisteredTaskNames() []string {
-	b.registeredTaskNames.RLock()
-	defer b.registeredTaskNames.RUnlock()
-	items := b.registeredTaskNames.items
-	return items
 }
 
 // AdjustRoutingKey makes sure the routing key is correct.
@@ -171,25 +136,28 @@ func (b *BaseBroker) AdjustRoutingKey(s *Signature) {
 
 // ErrCouldNotUnmarshalTaskSignature is returned when a delivery cannot be decoded into a task signature.
 type ErrCouldNotUnmarshalTaskSignature struct {
-	msg    []byte
-	reason string
+	msg []byte
+	err error
 }
 
 // Error implements the error interface
 func (e ErrCouldNotUnmarshalTaskSignature) Error() string {
-	return fmt.Sprintf("Could not unmarshal '%s' into a task signature: %v", e.msg, e.reason)
+	return fmt.Sprintf("Could not unmarshal '%s' into a task signature: %v", e.msg, e.err)
+}
+
+// Unwrap exposes the underlying decode error so callers can classify it
+// with errors.Is / errors.As (e.g. json.SyntaxError).
+func (e ErrCouldNotUnmarshalTaskSignature) Unwrap() error {
+	return e.err
 }
 
 // NewErrCouldNotUnmarshalTaskSignature returns new ErrCouldNotUnmarshalTaskSignature instance
 func NewErrCouldNotUnmarshalTaskSignature(msg []byte, err error) ErrCouldNotUnmarshalTaskSignature {
-	return ErrCouldNotUnmarshalTaskSignature{msg: msg, reason: err.Error()}
+	return ErrCouldNotUnmarshalTaskSignature{msg: msg, err: err}
 }
 
 // ErrConsumerStopped indicates that the operation is now illegal because of the consumer being stopped.
 var ErrConsumerStopped = errors.New("the server has been stopped")
-
-// ErrStopTaskDeletion indicates that the task should not be deleted from source after task failure
-var ErrStopTaskDeletion = errors.New("task should not be deleted")
 
 const defaultRedisDelayedTasksKey = "delayed_tasks"
 
@@ -200,7 +168,6 @@ type RedisBroker struct {
 	consumingWG          sync.WaitGroup // wait group to make sure whole consumption completes
 	processingWG         sync.WaitGroup // use wait group to make sure task processing completes
 	delayedWG            sync.WaitGroup
-	redsync              *redsync.Redsync
 	redisDelayedTasksKey string
 }
 
@@ -234,16 +201,16 @@ func (b *RedisBroker) StartConsuming(consumerTag string, concurrency int, taskPr
 	// Ping the server to make sure connection is live
 	_, err := b.rclient.Ping(context.Background()).Result()
 	if err != nil {
-		b.GetRetryFunc()(b.GetRetryStopChan())
+		b.retryFunc(b.retryStopChan)
 
 		// Return err if retry is still true.
 		// If retry is false, broker.StopConsuming() has been called and
 		// therefore Redis might have been stopped. Return nil exit
 		// StartConsuming()
-		if b.GetRetry() {
-			return b.GetRetry(), err
+		if b.retrying() {
+			return b.retrying(), err
 		}
-		return b.GetRetry(), ErrConsumerStopped
+		return b.retrying(), ErrConsumerStopped
 	}
 
 	// Channel to which we will push tasks ready for processing by worker
@@ -265,14 +232,28 @@ func (b *RedisBroker) StartConsuming(consumerTag string, concurrency int, taskPr
 		for {
 			select {
 			// A way to stop this goroutine from b.StopConsuming
-			case <-b.GetStopChan():
+			case <-b.stopChan:
 				close(deliveries)
 				return
 			case <-pool:
-				task, _ := b.nextTask(getQueue(b.GetConfig(), taskProcessor))
-				//TODO: should this error be ignored?
+				task, err := b.nextTask(getQueue(b.GetConfig(), taskProcessor))
+				// redis.Nil means the BLPOP timed out on an empty queue;
+				// context.Canceled means the broker is shutting down —
+				// anything else is a real failure and must not be silent
+				if err != nil && !errors.Is(err, redis.Nil) && !errors.Is(err, context.Canceled) {
+					slog.Error("failed to fetch task", "error", err)
+				}
 				if len(task) > 0 {
-					deliveries <- task
+					// the send must be cancellable: if consume() already
+					// returned (error path) nothing drains deliveries and a
+					// plain send would block forever with a popped task
+					select {
+					case deliveries <- task:
+					case <-b.stopChan:
+						pool <- struct{}{}
+						close(deliveries)
+						return
+					}
 				}
 
 				pool <- struct{}{}
@@ -289,7 +270,7 @@ func (b *RedisBroker) StartConsuming(consumerTag string, concurrency int, taskPr
 		for {
 			select {
 			// A way to stop this goroutine from b.StopConsuming
-			case <-b.GetStopChan():
+			case <-b.stopChan:
 				return
 			default:
 				task, err := b.nextDelayedTask(b.redisDelayedTasksKey)
@@ -301,24 +282,40 @@ func (b *RedisBroker) StartConsuming(consumerTag string, concurrency int, taskPr
 				decoder := json.NewDecoder(bytes.NewReader(task))
 				decoder.UseNumber()
 				if err := decoder.Decode(signature); err != nil {
+					// poison message: nextDelayedTask already removed it from
+					// the delayed set, publishing the zero-value signature
+					// would enqueue a bogus task instead
 					slog.Error("failed to unmarshal task signature", "error", NewErrCouldNotUnmarshalTaskSignature(task, err))
+					continue
 				}
 
-				if err := b.Publish(context.Background(), signature); err != nil {
+				if err := b.Publish(b.ctx, signature); err != nil {
 					slog.Error("failed to publish delayed task", "error", err)
+					// the task was already removed from the delayed set by
+					// nextDelayedTask; put it back (due immediately) so it is
+					// retried on the next poll instead of being lost
+					if zerr := b.rclient.ZAdd(context.Background(), b.redisDelayedTasksKey, redis.Z{
+						Score:  float64(time.Now().UnixNano()),
+						Member: task,
+					}).Err(); zerr != nil {
+						slog.Error("failed to requeue delayed task", "error", zerr)
+					}
 				}
 			}
 		}
 	}()
 
 	if err := b.consume(deliveries, concurrency, taskProcessor); err != nil {
-		return b.GetRetry(), err
+		// Wait for in-flight task processing before returning, so worker
+		// goroutines don't outlive the broker's reported stop
+		b.processingWG.Wait()
+		return b.retrying(), err
 	}
 
 	// Waiting for any tasks being processed to finish
 	b.processingWG.Wait()
 
-	return b.GetRetry(), nil
+	return b.retrying(), nil
 }
 
 // StopConsuming quits the loop and waits for consumption goroutines to finish.
@@ -358,12 +355,13 @@ func (b *RedisBroker) Publish(ctx context.Context, signature *Signature) error {
 }
 
 // GetPendingTasks returns a slice of task signatures waiting in the queue
-func (b *RedisBroker) GetPendingTasks(queue string) ([]*Signature, error) {
+// (debug helper, not part of the Broker interface)
+func (b *RedisBroker) GetPendingTasks(ctx context.Context, queue string) ([]*Signature, error) {
 
 	if queue == "" {
 		queue = b.GetConfig().DefaultQueue
 	}
-	results, err := b.rclient.LRange(context.Background(), queue, 0, -1).Result()
+	results, err := b.rclient.LRange(ctx, queue, 0, -1).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -381,9 +379,10 @@ func (b *RedisBroker) GetPendingTasks(queue string) ([]*Signature, error) {
 	return taskSignatures, nil
 }
 
-// GetDelayedTasks returns a slice of task signatures that are scheduled, but not yet in the queue
-func (b *RedisBroker) GetDelayedTasks() ([]*Signature, error) {
-	results, err := b.rclient.ZRange(context.Background(), b.redisDelayedTasksKey, 0, -1).Result()
+// GetDelayedTasks returns a slice of task signatures that are scheduled, but
+// not yet in the queue (debug helper, not part of the Broker interface)
+func (b *RedisBroker) GetDelayedTasks(ctx context.Context) ([]*Signature, error) {
+	results, err := b.rclient.ZRange(ctx, b.redisDelayedTasksKey, 0, -1).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -458,13 +457,19 @@ func (b *RedisBroker) consumeOne(delivery []byte, taskProcessor TaskProcessor) e
 
 	// If the task is not registered, we requeue it,
 	// there might be different workers for processing specific tasks
-	if !b.IsTaskRegistered(signature.Name) {
+	if !b.taskRegistered(signature.Name) {
 		if signature.IgnoreWhenTaskNotRegistered {
 			return nil
 		}
 		slog.Info("task not registered with this worker, requeuing", "delivery", string(delivery))
 
-		b.rclient.RPush(context.Background(), getQueue(b.GetConfig(), taskProcessor), delivery)
+		if err := b.rclient.RPush(b.ctx, getQueue(b.GetConfig(), taskProcessor), delivery).Err(); err != nil {
+			// the message was already popped by BLPOP, a silent failure here
+			// would lose it entirely — surface the error so it is observable
+			// and triggers the reconnect/retry path
+			slog.Error("failed to requeue unregistered task", "error", err)
+			return err
+		}
 		return nil
 	}
 
@@ -485,7 +490,9 @@ func (b *RedisBroker) nextTask(queue string) (result []byte, err error) {
 	}
 	pollPeriod := time.Duration(pollPeriodMilliseconds) * time.Millisecond
 
-	items, err := b.rclient.BLPop(context.Background(), pollPeriod, queue).Result()
+	// BLPop on b.ctx: StopConsuming cancels it so a blocked poll returns
+	// promptly instead of waiting out the full poll period
+	items, err := b.rclient.BLPop(b.ctx, pollPeriod, queue).Result()
 	if err != nil {
 		return []byte{}, err
 	}
@@ -526,7 +533,7 @@ func (b *RedisBroker) nextDelayedTask(key string) (result []byte, err error) {
 			now := time.Now().UTC().UnixNano()
 
 			// https://redis.io/commands/zrangebyscore
-			ctx := context.Background()
+			ctx := b.ctx
 			items, err = tx.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
 				Min: "0", Max: strconv.FormatInt(now, 10), Offset: 0, Count: 1,
 			}).Result()
@@ -548,7 +555,7 @@ func (b *RedisBroker) nextDelayedTask(key string) (result []byte, err error) {
 			return err
 		}
 
-		if err = b.rclient.Watch(context.Background(), watchFunc, key); err != nil {
+		if err = b.rclient.Watch(b.ctx, watchFunc, key); err != nil {
 			return
 		} else {
 			break
