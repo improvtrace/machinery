@@ -80,9 +80,8 @@ If you already have a `redis.UniversalClient`, inject it directly with
 
 ## Configuration
 
-`Config` can be constructed in code, loaded from environment variables
-(`NewFromEnvironment`, via [envconfig](https://github.com/kelseyhightower/envconfig)),
-or from a YAML file (`NewFromYaml`).
+`Config` is constructed in code and passed to `NewServer` together with a
+broker, a backend and a lock.
 
 Key fields:
 
@@ -112,6 +111,24 @@ Key fields:
 | `AsyncResult`, `ChainAsyncResult`, `ChordAsyncResult` | Result handles (`Get`, `GetWithTimeout`, `Touch`) |
 | `NewGoRedisClient` | Build a `redis.UniversalClient` from `Config` (single / sentinel / cluster) |
 | `RegisterPeriodicTask/Chain/Group/Chord` | Cron-scheduled workflows (cron spec, guarded by the lock) |
+
+## Project layout
+
+Everything lives in one flat `package machinery` at the repo root:
+
+| File | Contents |
+|---|---|
+| `machinery.go` | `Server` and `Worker` — task registration, publishing, consumption |
+| `broker.go` | `Broker` / `TaskProcessor` interfaces, `BaseBroker`, errors, `RedisBroker` |
+| `backend.go` | `Backend` interface, `BaseBackend`, `RedisBackend`, result handles |
+| `lock.go` | `Lock` interface and `RedisLock` |
+| `config.go` | `Config` and `RedisConfig` |
+| `redis.go` | `NewGoRedisClient` (single / Sentinel / cluster) |
+| `tasks.go` | `Signature`, `Task`, task states, chains / groups / chords, reflection helpers |
+| `log.go` | Levelled logger |
+| `utils.go` | Deep copy and misc helpers |
+| `retry.go` | Retry closure and Fibonacci backoff |
+| `tracing.go` | OpenTracing integration |
 
 ## License
 
