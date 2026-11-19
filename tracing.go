@@ -63,7 +63,7 @@ func (c consumerOption) Apply(o *opentracing.StartSpanOptions) {
 	opentracing_ext.SpanKindConsumer.Apply(o)
 }
 
-// ConsumerOption ...
+// ConsumerOption returns a StartSpanOption tagging the span as a consumer.
 func ConsumerOption(producer opentracing.SpanContext) opentracing.StartSpanOption {
 	return consumerOption{producer}
 }
@@ -74,12 +74,12 @@ func (p producerOption) Apply(o *opentracing.StartSpanOptions) {
 	opentracing_ext.SpanKindProducer.Apply(o)
 }
 
-// ProducerOption ...
+// ProducerOption returns a StartSpanOption tagging the span as a producer.
 func ProducerOption() opentracing.StartSpanOption {
 	return producerOption{}
 }
 
-// AnnotateSpanWithSignatureInfo ...
+// AnnotateSpanWithSignatureInfo tags the span with task signature details.
 func AnnotateSpanWithSignatureInfo(span opentracing.Span, signature *Signature) {
 	// tag the span with some info about the signature
 	span.SetTag("signature.name", signature.Name)
@@ -95,7 +95,7 @@ func AnnotateSpanWithSignatureInfo(span opentracing.Span, signature *Signature) 
 	}
 }
 
-// AnnotateSpanWithChainInfo ...
+// AnnotateSpanWithChainInfo tags the span with chain workflow details.
 func AnnotateSpanWithChainInfo(span opentracing.Span, chain *Chain) {
 	// tag the span with some info about the chain
 	span.SetTag("chain.tasks.length", len(chain.Tasks))
@@ -106,7 +106,7 @@ func AnnotateSpanWithChainInfo(span opentracing.Span, chain *Chain) {
 	}
 }
 
-// AnnotateSpanWithGroupInfo ...
+// AnnotateSpanWithGroupInfo tags the span with group workflow details.
 func AnnotateSpanWithGroupInfo(span opentracing.Span, group *Group, sendConcurrency int) {
 	// tag the span with some info about the group
 	span.SetTag("group.uuid", group.GroupUUID)
@@ -126,7 +126,7 @@ func AnnotateSpanWithGroupInfo(span opentracing.Span, group *Group, sendConcurre
 	}
 }
 
-// AnnotateSpanWithChordInfo ...
+// AnnotateSpanWithChordInfo tags the span with chord workflow details.
 func AnnotateSpanWithChordInfo(span opentracing.Span, chord *Chord, sendConcurrency int) {
 	// tag the span with chord specific info
 	span.SetTag("chord.callback.uuid", chord.Callback.UUID)

@@ -5,8 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"reflect"
-	"sync"
 	"time"
 
 	"github.com/go-redsync/redsync/v4"
@@ -31,7 +31,7 @@ type Backend interface {
 	SetStateFailure(signature *Signature, err string) error
 	GetState(taskUUID string) (*TaskState, error)
 
-	// Purging stored stored tasks states and group meta data
+	// Purging stored task states and group meta data
 	PurgeState(taskUUID string) error
 	PurgeGroupMeta(groupUUID string) error
 }
@@ -54,9 +54,8 @@ func (b *BaseBackend) GetConfig() *Config {
 // RedisBackend represents a Redis result backend
 type RedisBackend struct {
 	BaseBackend
-	rclient   redis.UniversalClient
-	redsync   *redsync.Redsync
-	redisOnce sync.Once
+	rclient redis.UniversalClient
+	redsync *redsync.Redsync
 }
 
 // NewRedisBackend creates RedisBackend instance
@@ -133,7 +132,7 @@ func (b *RedisBackend) GroupTaskStates(groupUUID string, groupTaskCount int) ([]
 }
 
 // TriggerChord flags chord as triggered in the backend storage to make sure
-// chord is never trigerred multiple times. Returns a boolean flag to indicate
+// chord is never triggered multiple times. Returns a boolean flag to indicate
 // whether the worker should trigger chord (true) or no if it has been triggered
 // already (false)
 func (b *RedisBackend) TriggerChord(groupUUID string) (bool, error) {
@@ -296,7 +295,7 @@ func (b *RedisBackend) getStates(taskUUIDs ...string) ([]*TaskState, error) {
 		decoder := json.NewDecoder(bytes.NewReader(stateBytes))
 		decoder.UseNumber()
 		if err1 = decoder.Decode(taskState); err1 != nil {
-			ERROR.Print(err1)
+			slog.Error("failed to decode task state", "error", err1)
 			return taskStates, err1
 		}
 		taskStates[i] = taskState
@@ -428,6 +427,7 @@ func (asyncResult *AsyncResult) Get(sleepDuration time.Duration) ([]reflect.Valu
 // GetWithTimeout returns task results with a timeout (synchronous blocking call)
 func (asyncResult *AsyncResult) GetWithTimeout(timeoutDuration, sleepDuration time.Duration) ([]reflect.Value, error) {
 	timeout := time.NewTimer(timeoutDuration)
+	defer timeout.Stop()
 
 	for {
 		select {
@@ -509,6 +509,7 @@ func (chainAsyncResult *ChainAsyncResult) GetWithTimeout(timeoutDuration, sleepD
 	)
 
 	timeout := time.NewTimer(timeoutDuration)
+	defer timeout.Stop()
 	ln := len(chainAsyncResult.asyncResults)
 	lastResult := chainAsyncResult.asyncResults[ln-1]
 
@@ -549,6 +550,7 @@ func (chordAsyncResult *ChordAsyncResult) GetWithTimeout(timeoutDuration, sleepD
 	)
 
 	timeout := time.NewTimer(timeoutDuration)
+	defer timeout.Stop()
 	for {
 		select {
 		case <-timeout.C:
@@ -557,13 +559,13 @@ func (chordAsyncResult *ChordAsyncResult) GetWithTimeout(timeoutDuration, sleepD
 			for _, asyncResult := range chordAsyncResult.groupAsyncResults {
 				_, errcur := asyncResult.Touch()
 				if errcur != nil {
-					return nil, err
+					return nil, errcur
 				}
 			}
 
 			results, err = chordAsyncResult.chordAsyncResult.Touch()
 			if err != nil {
-				return nil, nil
+				return nil, err
 			}
 			if results != nil {
 				return results, err

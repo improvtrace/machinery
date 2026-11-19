@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"runtime/debug"
 	"strconv"
@@ -18,7 +19,7 @@ import (
 	opentracing_log "github.com/opentracing/opentracing-go/log"
 )
 
-// ErrTaskPanicked ...
+// ErrTaskPanicked is returned when invoking a task causes a panic.
 var ErrTaskPanicked = errors.New("Invoking task caused a panic")
 
 // Task wraps a signature and methods used to reflect task arguments and
@@ -50,7 +51,7 @@ func SignatureFromContext(ctx context.Context) *Signature {
 }
 
 // NewWithSignature is the same as New but injects the signature
-func NewWithSignature(taskFunc interface{}, signature *Signature) (*Task, error) {
+func NewWithSignature(taskFunc any, signature *Signature) (*Task, error) {
 	args := signature.Args
 	ctx := context.Background()
 	ctx = context.WithValue(ctx, signatureCtx, signature)
@@ -68,7 +69,7 @@ func NewWithSignature(taskFunc interface{}, signature *Signature) (*Task, error)
 	}
 
 	if err := task.ReflectArgs(args); err != nil {
-		return nil, fmt.Errorf("Reflect task args error: %s", err)
+		return nil, fmt.Errorf("Reflect task args error: %w", err)
 	}
 
 	return task, nil
@@ -76,7 +77,7 @@ func NewWithSignature(taskFunc interface{}, signature *Signature) (*Task, error)
 
 // New tries to use reflection to convert the function and arguments
 // into a reflect.Value and prepare it for invocation
-func NewTask(taskFunc interface{}, args []Arg) (*Task, error) {
+func NewTask(taskFunc any, args []Arg) (*Task, error) {
 	task := &Task{
 		TaskFunc: reflect.ValueOf(taskFunc),
 		Context:  context.Background(),
@@ -91,7 +92,7 @@ func NewTask(taskFunc interface{}, args []Arg) (*Task, error) {
 	}
 
 	if err := task.ReflectArgs(args); err != nil {
-		return nil, fmt.Errorf("Reflect task args error: %s", err)
+		return nil, fmt.Errorf("Reflect task args error: %w", err)
 	}
 
 	return task, nil
@@ -131,7 +132,7 @@ func (t *Task) Call() (taskResults []*TaskResult, err error) {
 			}
 
 			// Print stack trace
-			ERROR.Printf("%s", debug.Stack())
+			slog.Error("task panicked", "stack", string(debug.Stack()))
 		}
 	}()
 
@@ -204,7 +205,7 @@ func (t *Task) ReflectArgs(args []Arg) error {
 	return nil
 }
 
-// ErrRetryTaskLater ...
+// ErrRetryTaskLater instructs the worker to retry the task at a specific time.
 type ErrRetryTaskLater struct {
 	name, msg string
 	retryIn   time.Duration
@@ -232,11 +233,11 @@ type Retriable interface {
 
 // TaskResult represents an actual return value of a processed task
 type TaskResult struct {
-	Type  string      `bson:"type"`
-	Value interface{} `bson:"value"`
+	Type  string `bson:"type"`
+	Value any    `bson:"value"`
 }
 
-// ReflectTaskResults ...
+// ReflectTaskResults converts task results into reflect values.
 func ReflectTaskResults(taskResults []*TaskResult) ([]reflect.Value, error) {
 	resultValues := make([]reflect.Value, len(taskResults))
 	for i, taskResult := range taskResults {
@@ -249,7 +250,7 @@ func ReflectTaskResults(taskResults []*TaskResult) ([]reflect.Value, error) {
 	return resultValues, nil
 }
 
-// HumanReadableResults ...
+// HumanReadableResults renders task results as a human readable string.
 func HumanReadableResults(results []reflect.Value) string {
 	if len(results) == 1 {
 		return fmt.Sprintf("%v", results[0].Interface())
@@ -265,13 +266,13 @@ func HumanReadableResults(results []reflect.Value) string {
 
 // Arg represents a single argument passed to invocation fo a task
 type Arg struct {
-	Name  string      `bson:"name"`
-	Type  string      `bson:"type"`
-	Value interface{} `bson:"value"`
+	Name  string `bson:"name"`
+	Type  string `bson:"type"`
+	Value any    `bson:"value"`
 }
 
 // Headers represents the headers which should be used to direct the task
-type Headers map[string]interface{}
+type Headers map[string]any
 
 // Set on Headers implements opentracing.TextMapWriter for trace propagation
 func (h Headers) Set(key, val string) {
@@ -280,7 +281,7 @@ func (h Headers) Set(key, val string) {
 
 // ForeachKey on Headers implements opentracing.TextMapReader for trace propagation.
 // It is essentially the same as the opentracing.TextMapReader implementation except
-// for the added casting from interface{} to string.
+// for the added casting from any to string.
 func (h Headers) ForeachKey(handler func(key, val string) error) error {
 	for k, v := range h {
 		// Skip any non string values
@@ -346,6 +347,7 @@ func CopySignatures(signatures ...*Signature) []*Signature {
 
 func CopySignature(signature *Signature) *Signature {
 	var sig = new(Signature)
+	// DeepCopy cannot fail here: both operands are *Signature, so the error is unreachable.
 	_ = DeepCopy(sig, signature)
 	return sig
 }
@@ -388,7 +390,7 @@ type GroupMeta struct {
 	TTL            int64     `bson:"ttl,omitempty"`
 }
 
-// NewPendingTaskState ...
+// NewPendingTaskState returns a task state set to PENDING.
 func NewPendingTaskState(signature *Signature) *TaskState {
 	return &TaskState{
 		TaskUUID:  signature.UUID,
@@ -398,7 +400,7 @@ func NewPendingTaskState(signature *Signature) *TaskState {
 	}
 }
 
-// NewReceivedTaskState ...
+// NewReceivedTaskState returns a task state set to RECEIVED.
 func NewReceivedTaskState(signature *Signature) *TaskState {
 	return &TaskState{
 		TaskUUID: signature.UUID,
@@ -406,7 +408,7 @@ func NewReceivedTaskState(signature *Signature) *TaskState {
 	}
 }
 
-// NewStartedTaskState ...
+// NewStartedTaskState returns a task state set to STARTED.
 func NewStartedTaskState(signature *Signature) *TaskState {
 	return &TaskState{
 		TaskUUID: signature.UUID,
@@ -414,7 +416,7 @@ func NewStartedTaskState(signature *Signature) *TaskState {
 	}
 }
 
-// NewSuccessTaskState ...
+// NewSuccessTaskState returns a task state set to SUCCESS.
 func NewSuccessTaskState(signature *Signature, results []*TaskResult) *TaskState {
 	return &TaskState{
 		TaskUUID: signature.UUID,
@@ -423,7 +425,7 @@ func NewSuccessTaskState(signature *Signature, results []*TaskResult) *TaskState
 	}
 }
 
-// NewFailureTaskState ...
+// NewFailureTaskState returns a task state set to FAILURE.
 func NewFailureTaskState(signature *Signature, err string) *TaskState {
 	return &TaskState{
 		TaskUUID: signature.UUID,
@@ -432,7 +434,7 @@ func NewFailureTaskState(signature *Signature, err string) *TaskState {
 	}
 }
 
-// NewRetryTaskState ...
+// NewRetryTaskState returns a task state set to RETRY.
 func NewRetryTaskState(signature *Signature) *TaskState {
 	return &TaskState{
 		TaskUUID: signature.UUID,
@@ -556,7 +558,7 @@ var (
 // ValidateTask validates task function using reflection and makes sure
 // it has a proper signature. Functions used as tasks must return at least a
 // single value and the last return type must be error
-func ValidateTask(task interface{}) error {
+func ValidateTask(task any) error {
 	v := reflect.ValueOf(task)
 	t := v.Type()
 
@@ -617,12 +619,12 @@ var (
 
 	ctxType = reflect.TypeOf((*context.Context)(nil)).Elem()
 
-	typeConversionError = func(argValue interface{}, argTypeStr string) error {
+	typeConversionError = func(argValue any, argTypeStr string) error {
 		return fmt.Errorf("%v is not %v", argValue, argTypeStr)
 	}
 )
 
-// ErrUnsupportedType ...
+// ErrUnsupportedType is returned when a task argument has an unsupported type.
 type ErrUnsupportedType struct {
 	valueType string
 }
@@ -637,8 +639,8 @@ func (e ErrUnsupportedType) Error() string {
 	return fmt.Sprintf("%v is not one of supported types", e.valueType)
 }
 
-// ReflectValue converts interface{} to reflect.Value based on string type
-func ReflectValue(valueType string, value interface{}) (reflect.Value, error) {
+// ReflectValue converts any to reflect.Value based on string type
+func ReflectValue(valueType string, value any) (reflect.Value, error) {
 	if strings.HasPrefix(valueType, "[]") {
 		return reflectValues(valueType, value)
 	}
@@ -646,9 +648,9 @@ func ReflectValue(valueType string, value interface{}) (reflect.Value, error) {
 	return reflectValue(valueType, value)
 }
 
-// reflectValue converts interface{} to reflect.Value based on string type
+// reflectValue converts any to reflect.Value based on string type
 // representing a base type (not a slice)
-func reflectValue(valueType string, value interface{}) (reflect.Value, error) {
+func reflectValue(valueType string, value any) (reflect.Value, error) {
 	theType, ok := typesMap[valueType]
 	if !ok {
 		return reflect.Value{}, NewErrUnsupportedType(valueType)
@@ -713,9 +715,9 @@ func reflectValue(valueType string, value interface{}) (reflect.Value, error) {
 	return reflect.Value{}, NewErrUnsupportedType(valueType)
 }
 
-// reflectValues converts interface{} to reflect.Value based on string type
+// reflectValues converts any to reflect.Value based on string type
 // representing a slice of values
-func reflectValues(valueType string, value interface{}) (reflect.Value, error) {
+func reflectValues(valueType string, value any) (reflect.Value, error) {
 	theType, ok := typesMap[valueType]
 	if !ok {
 		return reflect.Value{}, NewErrUnsupportedType(valueType)
@@ -828,7 +830,7 @@ func reflectValues(valueType string, value interface{}) (reflect.Value, error) {
 	return reflect.Value{}, NewErrUnsupportedType(valueType)
 }
 
-func getBoolValue(theType string, value interface{}) (bool, error) {
+func getBoolValue(theType string, value any) (bool, error) {
 	b, ok := value.(bool)
 	if !ok {
 		return false, typeConversionError(value, typesMap[theType].String())
@@ -837,7 +839,7 @@ func getBoolValue(theType string, value interface{}) (bool, error) {
 	return b, nil
 }
 
-func getIntValue(theType string, value interface{}) (int64, error) {
+func getIntValue(theType string, value any) (int64, error) {
 	// We use https://golang.org/pkg/encoding/json/#Decoder.UseNumber when unmarshaling signatures.
 	// This is because JSON only supports 64-bit floating point numbers and we could lose precision
 	// when converting from float64 to signed integer
@@ -858,7 +860,7 @@ func getIntValue(theType string, value interface{}) (int64, error) {
 	return n, nil
 }
 
-func getUintValue(theType string, value interface{}) (uint64, error) {
+func getUintValue(theType string, value any) (uint64, error) {
 	// Losing precision only happens in receiving a JSON number from a language like js,
 	// and receiving a large uint number from golang or python could cause json.Number.Int64 be turned into a panic.
 	// So we use strconv.ParseUint to correctly parse a uint value.
@@ -888,7 +890,7 @@ func getUintValue(theType string, value interface{}) (uint64, error) {
 	return n, nil
 }
 
-func getFloatValue(theType string, value interface{}) (float64, error) {
+func getFloatValue(theType string, value any) (float64, error) {
 	// We use https://golang.org/pkg/encoding/json/#Decoder.UseNumber when unmarshaling signatures.
 	// This is because JSON only supports 64-bit floating point numbers and we could lose precision
 	if strings.HasPrefix(fmt.Sprintf("%T", value), "json.Number") {
@@ -908,7 +910,7 @@ func getFloatValue(theType string, value interface{}) (float64, error) {
 	return f, nil
 }
 
-func getStringValue(theType string, value interface{}) (string, error) {
+func getStringValue(theType string, value any) (string, error) {
 	s, ok := value.(string)
 	if !ok {
 		return "", typeConversionError(value, typesMap[theType].String())

@@ -12,26 +12,24 @@ const (
 // Config holds all configuration for a machinery server. Construct it in code
 // and pass it to NewServer together with a broker, a backend and a lock.
 type Config struct {
-	Broker                  string
-	Lock                    string
-	MultipleBrokerSeparator string
-	DefaultQueue            string
-	ResultBackend           string
-	ResultsExpireIn         int
-	Redis                   *RedisConfig
-	TLSConfig               *tls.Config
+	Broker          string
+	DefaultQueue    string
+	ResultBackend   string
+	ResultsExpireIn int
+	Redis           *RedisConfig
+	TLSConfig       *tls.Config
 	// NoUnixSignals - when set disables signal handling in machinery
 	NoUnixSignals bool
 }
 
-// RedisConfig ...
+// RedisConfig holds redis-specific configuration for broker, backend and lock.
 type RedisConfig struct {
 	// NormalTasksPollPeriod specifies the period in milliseconds when polling redis for normal tasks
 	// Default: 1000
 	NormalTasksPollPeriod int
 
 	// DelayedTasksPollPeriod specifies the period in milliseconds when polling redis for delayed tasks
-	// Default: 20
+	// Default: 500
 	DelayedTasksPollPeriod int
 
 	// DelayedTasksKey specifies the sorted-set key used to store delayed tasks

@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-redsync/redsync/v4"
@@ -46,17 +48,20 @@ type registeredTaskNames struct {
 type BaseBroker struct {
 	cnf                 *Config
 	registeredTaskNames registeredTaskNames
-	retry               bool
-	retryFunc           func(chan int)
-	retryStopChan       chan int
-	stopChan            chan int
+	// stopped flips to true in StopConsuming; zero value (false) means the
+	// broker is accepting consumption, so a literal-initialized BaseBroker is
+	// valid without extra setup. Accessed atomically: read from consumer
+	// goroutines, written by StopConsuming.
+	stopped       atomic.Bool
+	retryFunc     func(chan int)
+	retryStopChan chan int
+	stopChan      chan int
 }
 
 // NewBaseBroker creates new BaseBroker instance
 func NewBaseBroker(cnf *Config) BaseBroker {
 	return BaseBroker{
 		cnf:           cnf,
-		retry:         true,
 		stopChan:      make(chan int),
 		retryStopChan: make(chan int),
 	}
@@ -67,22 +72,22 @@ func (b *BaseBroker) GetConfig() *Config {
 	return b.cnf
 }
 
-// GetRetry ...
+// GetRetry reports whether the broker should retry reconnecting after a failure.
 func (b *BaseBroker) GetRetry() bool {
-	return b.retry
+	return !b.stopped.Load()
 }
 
-// GetRetryFunc ...
+// GetRetryFunc returns the retry closure used to space out reconnection attempts.
 func (b *BaseBroker) GetRetryFunc() func(chan int) {
 	return b.retryFunc
 }
 
-// GetRetryStopChan ...
+// GetRetryStopChan returns the channel used to abort the retry closure early.
 func (b *BaseBroker) GetRetryStopChan() chan int {
 	return b.retryStopChan
 }
 
-// GetStopChan ...
+// GetStopChan returns the channel that is closed when consumption stops.
 func (b *BaseBroker) GetStopChan() chan int {
 	return b.stopChan
 }
@@ -132,16 +137,16 @@ func (b *BaseBroker) StartConsuming(consumerTag string, concurrency int, taskPro
 // StopConsuming is a common part of StopConsuming
 func (b *BaseBroker) StopConsuming() {
 	// Do not retry from now on
-	b.retry = false
+	b.stopped.Store(true)
 	// Stop the retry closure earlier
 	select {
 	case b.retryStopChan <- 1:
-		WARNING.Print("Stopping retry closure.")
+		slog.Warn("stopping retry closure")
 	default:
 	}
 	// Notifying the stop channel stops consuming of messages
 	close(b.stopChan)
-	WARNING.Print("Stop channel")
+	slog.Warn("stop channel closed")
 }
 
 // GetRegisteredTaskNames returns registered tasks names
@@ -164,7 +169,7 @@ func (b *BaseBroker) AdjustRoutingKey(s *Signature) {
 	s.RoutingKey = b.GetConfig().DefaultQueue
 }
 
-// ErrCouldNotUnmarshalTaskSignature ...
+// ErrCouldNotUnmarshalTaskSignature is returned when a delivery cannot be decoded into a task signature.
 type ErrCouldNotUnmarshalTaskSignature struct {
 	msg    []byte
 	reason string
@@ -196,8 +201,8 @@ type RedisBroker struct {
 	processingWG         sync.WaitGroup // use wait group to make sure task processing completes
 	delayedWG            sync.WaitGroup
 	redsync              *redsync.Redsync
-	redisOnce            sync.Once
 	redisDelayedTasksKey string
+	ownsRClient          bool
 }
 
 // NewRedisBroker creates RedisBroker instance
@@ -206,6 +211,7 @@ func NewRedisBroker(cnf *Config, addrs []string, db int) Broker {
 		BaseBroker: NewBaseBroker(cnf),
 		rclient:    NewGoRedisClient(cnf, addrs, db),
 	}
+	b.ownsRClient = true
 	if cnf.Redis != nil && cnf.Redis.DelayedTasksKey != "" {
 		b.redisDelayedTasksKey = cnf.Redis.DelayedTasksKey
 	} else {
@@ -268,7 +274,7 @@ func (b *RedisBroker) StartConsuming(consumerTag string, concurrency int, taskPr
 	// we send it to the deliveries channel
 	go func() {
 
-		INFO.Print("[*] Waiting for messages. To exit press CTRL+C")
+		slog.Info("waiting for messages. to exit press CTRL+C")
 
 		for {
 			select {
@@ -309,11 +315,11 @@ func (b *RedisBroker) StartConsuming(consumerTag string, concurrency int, taskPr
 				decoder := json.NewDecoder(bytes.NewReader(task))
 				decoder.UseNumber()
 				if err := decoder.Decode(signature); err != nil {
-					ERROR.Print(NewErrCouldNotUnmarshalTaskSignature(task, err))
+					slog.Error("failed to unmarshal task signature", "error", NewErrCouldNotUnmarshalTaskSignature(task, err))
 				}
 
 				if err := b.Publish(context.Background(), signature); err != nil {
-					ERROR.Print(err)
+					slog.Error("failed to publish delayed task", "error", err)
 				}
 			}
 		}
@@ -337,7 +343,10 @@ func (b *RedisBroker) StopConsuming() {
 	// Waiting for consumption to finish
 	b.consumingWG.Wait()
 
-	b.rclient.Close()
+	if b.ownsRClient {
+		// only close the client if this broker created it
+		b.rclient.Close()
+	}
 }
 
 // Publish places a new message on the default queue
@@ -347,7 +356,7 @@ func (b *RedisBroker) Publish(ctx context.Context, signature *Signature) error {
 
 	msg, err := json.Marshal(signature)
 	if err != nil {
-		return fmt.Errorf("JSON marshal error: %s", err)
+		return fmt.Errorf("JSON marshal error: %w", err)
 	}
 
 	// Check the ETA signature field, if it is set and it is in the future,
@@ -357,12 +366,12 @@ func (b *RedisBroker) Publish(ctx context.Context, signature *Signature) error {
 
 		if signature.ETA.After(now) {
 			score := signature.ETA.UnixNano()
-			err = b.rclient.ZAdd(context.Background(), b.redisDelayedTasksKey, redis.Z{Score: float64(score), Member: msg}).Err()
+			err = b.rclient.ZAdd(ctx, b.redisDelayedTasksKey, redis.Z{Score: float64(score), Member: msg}).Err()
 			return err
 		}
 	}
 
-	err = b.rclient.RPush(context.Background(), signature.RoutingKey, msg).Err()
+	err = b.rclient.RPush(ctx, signature.RoutingKey, msg).Err()
 	return err
 }
 
@@ -471,13 +480,13 @@ func (b *RedisBroker) consumeOne(delivery []byte, taskProcessor TaskProcessor) e
 		if signature.IgnoreWhenTaskNotRegistered {
 			return nil
 		}
-		INFO.Printf("Task not registered with this worker. Requeuing message: %s", delivery)
+		slog.Info("task not registered with this worker, requeuing", "delivery", string(delivery))
 
 		b.rclient.RPush(context.Background(), getQueue(b.GetConfig(), taskProcessor), delivery)
 		return nil
 	}
 
-	DEBUG.Printf("Received new message: %s", delivery)
+	slog.Debug("received new message", "delivery", string(delivery))
 
 	return taskProcessor.Process(signature)
 }

@@ -121,14 +121,16 @@ Everything lives in one flat `package machinery` at the repo root:
 | `machinery.go` | `Server` and `Worker` — task registration, publishing, consumption |
 | `broker.go` | `Broker` / `TaskProcessor` interfaces, `BaseBroker`, errors, `RedisBroker` |
 | `backend.go` | `Backend` interface, `BaseBackend`, `RedisBackend`, result handles |
-| `lock.go` | `Lock` interface and `RedisLock` |
+| `redis.go` | `NewGoRedisClient` (single / Sentinel / cluster), `Lock` interface and `RedisLock` |
 | `config.go` | `Config` and `RedisConfig` |
-| `redis.go` | `NewGoRedisClient` (single / Sentinel / cluster) |
 | `tasks.go` | `Signature`, `Task`, task states, chains / groups / chords, reflection helpers |
-| `log.go` | Levelled logger |
-| `utils.go` | Deep copy and misc helpers |
-| `retry.go` | Retry closure and Fibonacci backoff |
+| `utils.go` | Misc helpers, deep copy, retry closure and Fibonacci backoff |
 | `tracing.go` | OpenTracing integration |
+
+Logging uses the standard library's `log/slog`: the library emits records at
+`Debug`, `Info`, `Warn` and `Error` levels through `slog.Default()`. Configure
+logging in your application with `slog.SetDefault` (for example with a JSON
+handler) before launching workers.
 
 ## License
 

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/signal"
@@ -87,7 +88,7 @@ func (server *Server) SetBackend(backend Backend) {
 	server.backend = backend
 }
 
-// GetConfig returns connection object
+// GetConfig returns config
 func (server *Server) GetConfig() *Config {
 	return server.config
 }
@@ -103,7 +104,7 @@ func (server *Server) SetPreTaskHandler(handler func(*Signature)) {
 }
 
 // RegisterTasks registers all tasks at once
-func (server *Server) RegisterTasks(namedTaskFuncs map[string]interface{}) error {
+func (server *Server) RegisterTasks(namedTaskFuncs map[string]any) error {
 	for _, task := range namedTaskFuncs {
 		if err := ValidateTask(task); err != nil {
 			return err
@@ -117,7 +118,7 @@ func (server *Server) RegisterTasks(namedTaskFuncs map[string]interface{}) error
 }
 
 // RegisterTask registers a single task
-func (server *Server) RegisterTask(name string, taskFunc interface{}) error {
+func (server *Server) RegisterTask(name string, taskFunc any) error {
 	if err := ValidateTask(taskFunc); err != nil {
 		return err
 	}
@@ -133,7 +134,7 @@ func (server *Server) IsTaskRegistered(name string) bool {
 }
 
 // GetRegisteredTask returns registered task by name
-func (server *Server) GetRegisteredTask(name string) (interface{}, error) {
+func (server *Server) GetRegisteredTask(name string) (any, error) {
 	taskFunc, ok := server.registeredTasks.Load(name)
 	if !ok {
 		return nil, fmt.Errorf("Task not registered error: %s", name)
@@ -162,7 +163,7 @@ func (server *Server) SendTaskWithContext(ctx context.Context, signature *Signat
 
 	// Set initial task state to PENDING
 	if err := server.backend.SetStatePending(signature); err != nil {
-		return nil, fmt.Errorf("Set state pending error: %s", err)
+		return nil, fmt.Errorf("Set state pending error: %w", err)
 	}
 
 	if server.prePublishHandler != nil {
@@ -170,7 +171,7 @@ func (server *Server) SendTaskWithContext(ctx context.Context, signature *Signat
 	}
 
 	if err := server.broker.Publish(ctx, signature); err != nil {
-		return nil, fmt.Errorf("Publish message error: %s", err)
+		return nil, fmt.Errorf("Publish message error: %w", err)
 	}
 
 	return NewAsyncResult(signature, server.backend), nil
@@ -211,6 +212,10 @@ func (server *Server) SendGroupWithContext(ctx context.Context, group *Group, se
 	// Make sure result backend is defined
 	if server.backend == nil {
 		return nil, errors.New("Result backend required")
+	}
+
+	if sendConcurrency < 0 {
+		return nil, fmt.Errorf("sendConcurrency must be >= 0, got %d", sendConcurrency)
 	}
 
 	asyncResults := make([]*AsyncResult, len(group.Tasks))
@@ -255,7 +260,7 @@ func (server *Server) SendGroupWithContext(ctx context.Context, group *Group, se
 			}
 
 			if err != nil {
-				errorsChan <- fmt.Errorf("Publish message error: %s", err)
+				errorsChan <- fmt.Errorf("Publish message error: %w", err)
 				return
 			}
 
@@ -271,6 +276,8 @@ func (server *Server) SendGroupWithContext(ctx context.Context, group *Group, se
 
 	select {
 	case err := <-errorsChan:
+		// wait for in-flight publish goroutines before returning the shared slice
+		wg.Wait()
 		return asyncResults, err
 	case <-done:
 		return asyncResults, nil
@@ -310,7 +317,7 @@ func (server *Server) SendChord(chord *Chord, sendConcurrency int) (*ChordAsyncR
 func (server *Server) GetRegisteredTaskNames() []string {
 	taskNames := make([]string, 0)
 
-	server.registeredTasks.Range(func(key, value interface{}) bool {
+	server.registeredTasks.Range(func(key, value any) bool {
 		taskNames = append(taskNames, key.(string))
 		return true
 	})
@@ -335,7 +342,7 @@ func (server *Server) RegisterPeriodicTask(spec, name string, signature *Signatu
 		//send task
 		_, err = server.SendTask(CopySignature(signature))
 		if err != nil {
-			ERROR.Printf("periodic task failed. task name is: %s. error is %s", name, err.Error())
+			slog.Error("periodic task failed", "task", name, "error", err)
 		}
 	}
 
@@ -364,7 +371,7 @@ func (server *Server) RegisterPeriodicChain(spec, name string, signatures ...*Si
 		//send task
 		_, err = server.SendChain(chain)
 		if err != nil {
-			ERROR.Printf("periodic task failed. task name is: %s. error is %s", name, err.Error())
+			slog.Error("periodic task failed", "task", name, "error", err)
 		}
 	}
 
@@ -393,7 +400,7 @@ func (server *Server) RegisterPeriodicGroup(spec, name string, sendConcurrency i
 		//send task
 		_, err = server.SendGroup(group, sendConcurrency)
 		if err != nil {
-			ERROR.Printf("periodic task failed. task name is: %s. error is %s", name, err.Error())
+			slog.Error("periodic task failed", "task", name, "error", err)
 		}
 	}
 
@@ -423,7 +430,7 @@ func (server *Server) RegisterPeriodicChord(spec, name string, sendConcurrency i
 		//send task
 		_, err = server.SendChord(chord, sendConcurrency)
 		if err != nil {
-			ERROR.Printf("periodic task failed. task name is: %s. error is %s", name, err.Error())
+			slog.Error("periodic task failed", "task", name, "error", err)
 		}
 	}
 
@@ -453,7 +460,7 @@ var (
 // Launch starts a new worker process. The worker subscribes
 // to the default queue and processes incoming registered tasks
 func (worker *Worker) Launch() error {
-	errorsChan := make(chan error)
+	errorsChan := make(chan error, 2)
 
 	worker.LaunchAsync(errorsChan)
 
@@ -466,14 +473,15 @@ func (worker *Worker) LaunchAsync(errorsChan chan<- error) {
 	broker := worker.server.GetBroker()
 
 	// Log some useful information about worker configuration
-	INFO.Printf("Launching a worker with the following settings:")
-	INFO.Printf("- Broker: %s", RedactURL(cnf.Broker))
-	if worker.Queue == "" {
-		INFO.Printf("- DefaultQueue: %s", cnf.DefaultQueue)
-	} else {
-		INFO.Printf("- CustomQueue: %s", worker.Queue)
+	queue := cnf.DefaultQueue
+	if worker.Queue != "" {
+		queue = worker.Queue
 	}
-	INFO.Printf("- ResultBackend: %s", RedactURL(cnf.ResultBackend))
+	slog.Info("launching worker",
+		"broker", RedactURL(cnf.Broker),
+		"queue", queue,
+		"backend", RedactURL(cnf.ResultBackend),
+	)
 
 	var signalWG sync.WaitGroup
 	// Goroutine to start broker consumption and handle retries when broker connection dies
@@ -485,7 +493,7 @@ func (worker *Worker) LaunchAsync(errorsChan chan<- error) {
 				if worker.errorHandler != nil {
 					worker.errorHandler(err)
 				} else {
-					WARNING.Printf("Broker failed with error: %s", err)
+					slog.Warn("broker failed", "error", err)
 				}
 			} else {
 				signalWG.Wait()
@@ -502,12 +510,12 @@ func (worker *Worker) LaunchAsync(errorsChan chan<- error) {
 		// Goroutine Handle SIGINT and SIGTERM signals
 		go func() {
 			for s := range sig {
-				WARNING.Printf("Signal received: %v", s)
+				slog.Warn("signal received", "signal", s)
 				signalsReceived++
 
 				if signalsReceived < 2 {
 					// After first Ctrl+C start quitting the worker gracefully
-					WARNING.Print("Waiting for running tasks to finish before shutting down")
+					slog.Warn("waiting for running tasks to finish before shutting down")
 					signalWG.Add(1)
 					go func() {
 						worker.Quit()
@@ -548,7 +556,7 @@ func (worker *Worker) Process(signature *Signature) error {
 
 	// Update task state to RECEIVED
 	if err = worker.server.GetBackend().SetStateReceived(signature); err != nil {
-		return fmt.Errorf("Set state to 'received' for task %s returned error: %s", signature.UUID, err)
+		return fmt.Errorf("Set state to 'received' for task %s returned error: %w", signature.UUID, err)
 	}
 
 	// Prepare task for processing
@@ -569,7 +577,7 @@ func (worker *Worker) Process(signature *Signature) error {
 
 	// Update task state to STARTED
 	if err = worker.server.GetBackend().SetStateStarted(signature); err != nil {
-		return fmt.Errorf("Set state to 'started' for task %s returned error: %s", signature.UUID, err)
+		return fmt.Errorf("Set state to 'started' for task %s returned error: %w", signature.UUID, err)
 	}
 
 	//Run handler before the task is called
@@ -587,7 +595,7 @@ func (worker *Worker) Process(signature *Signature) error {
 	if err != nil {
 		// If a ErrRetryTaskLater was returned from the task,
 		// retry the task after specified duration
-		retriableErr, ok := interface{}(err).(ErrRetryTaskLater)
+		retriableErr, ok := any(err).(ErrRetryTaskLater)
 		if ok {
 			return worker.retryTaskIn(signature, retriableErr.RetryIn())
 		}
@@ -608,7 +616,7 @@ func (worker *Worker) Process(signature *Signature) error {
 func (worker *Worker) taskRetry(signature *Signature) error {
 	// Update task state to RETRY
 	if err := worker.server.GetBackend().SetStateRetry(signature); err != nil {
-		return fmt.Errorf("Set state to 'retry' for task %s returned error: %s", signature.UUID, err)
+		return fmt.Errorf("Set state to 'retry' for task %s returned error: %w", signature.UUID, err)
 	}
 
 	// Decrement the retry counter, when it reaches 0, we won't retry again
@@ -621,25 +629,25 @@ func (worker *Worker) taskRetry(signature *Signature) error {
 	eta := time.Now().UTC().Add(time.Second * time.Duration(signature.RetryTimeout))
 	signature.ETA = &eta
 
-	WARNING.Printf("Task %s failed. Going to retry in %d seconds.", signature.UUID, signature.RetryTimeout)
+	slog.Warn("task failed, retrying", "task", signature.UUID, "retryInSeconds", signature.RetryTimeout)
 
 	// Send the task back to the queue
 	_, err := worker.server.SendTask(signature)
 	return err
 }
 
-// taskRetryIn republishes the task to the queue with ETA of now + retryIn.Seconds()
+// retryTaskIn republishes the task to the queue with ETA of now + retryIn.Seconds()
 func (worker *Worker) retryTaskIn(signature *Signature, retryIn time.Duration) error {
 	// Update task state to RETRY
 	if err := worker.server.GetBackend().SetStateRetry(signature); err != nil {
-		return fmt.Errorf("Set state to 'retry' for task %s returned error: %s", signature.UUID, err)
+		return fmt.Errorf("Set state to 'retry' for task %s returned error: %w", signature.UUID, err)
 	}
 
 	// Delay task by retryIn duration
 	eta := time.Now().UTC().Add(retryIn)
 	signature.ETA = &eta
 
-	WARNING.Printf("Task %s failed. Going to retry in %.0f seconds.", signature.UUID, retryIn.Seconds())
+	slog.Warn("task failed, retrying", "task", signature.UUID, "retryIn", retryIn)
 
 	// Send the task back to the queue
 	_, err := worker.server.SendTask(signature)
@@ -651,18 +659,18 @@ func (worker *Worker) retryTaskIn(signature *Signature, retryIn time.Duration) e
 func (worker *Worker) taskSucceeded(signature *Signature, taskResults []*TaskResult) error {
 	// Update task state to SUCCESS
 	if err := worker.server.GetBackend().SetStateSuccess(signature, taskResults); err != nil {
-		return fmt.Errorf("Set state to 'success' for task %s returned error: %s", signature.UUID, err)
+		return fmt.Errorf("Set state to 'success' for task %s returned error: %w", signature.UUID, err)
 	}
 
 	// Log human readable results of the processed task
 	var debugResults = "[]"
 	results, err := ReflectTaskResults(taskResults)
 	if err != nil {
-		WARNING.Print(err)
+		slog.Warn("failed to reflect task results", "error", err)
 	} else {
 		debugResults = HumanReadableResults(results)
 	}
-	DEBUG.Printf("Processed task %s. Results = %s", signature.UUID, debugResults)
+	slog.Debug("task processed", "task", signature.UUID, "results", debugResults)
 
 	// Trigger success callbacks
 
@@ -696,7 +704,7 @@ func (worker *Worker) taskSucceeded(signature *Signature, taskResults []*TaskRes
 		signature.GroupTaskCount,
 	)
 	if err != nil {
-		return fmt.Errorf("Completed check for group %s returned error: %s", signature.GroupUUID, err)
+		return fmt.Errorf("Completed check for group %s returned error: %w", signature.GroupUUID, err)
 	}
 
 	// If the group has not yet completed, just return
@@ -707,7 +715,7 @@ func (worker *Worker) taskSucceeded(signature *Signature, taskResults []*TaskRes
 	// Trigger chord callback
 	shouldTrigger, err := worker.server.GetBackend().TriggerChord(signature.GroupUUID)
 	if err != nil {
-		return fmt.Errorf("Triggering chord for group %s returned error: %s", signature.GroupUUID, err)
+		return fmt.Errorf("Triggering chord for group %s returned error: %w", signature.GroupUUID, err)
 	}
 
 	// Chord has already been triggered
@@ -721,11 +729,10 @@ func (worker *Worker) taskSucceeded(signature *Signature, taskResults []*TaskRes
 		signature.GroupTaskCount,
 	)
 	if err != nil {
-		ERROR.Printf(
-			"Failed to get tasks states for group:[%s]. Task count:[%d]. The chord may not be triggered. Error:[%s]",
-			signature.GroupUUID,
-			signature.GroupTaskCount,
-			err,
+		slog.Error("failed to get task states for group, chord may not be triggered",
+			"group", signature.GroupUUID,
+			"taskCount", signature.GroupTaskCount,
+			"error", err,
 		)
 		return nil
 	}
@@ -760,13 +767,13 @@ func (worker *Worker) taskSucceeded(signature *Signature, taskResults []*TaskRes
 func (worker *Worker) taskFailed(signature *Signature, taskErr error) error {
 	// Update task state to FAILURE
 	if err := worker.server.GetBackend().SetStateFailure(signature, taskErr.Error()); err != nil {
-		return fmt.Errorf("Set state to 'failure' for task %s returned error: %s", signature.UUID, err)
+		return fmt.Errorf("Set state to 'failure' for task %s returned error: %w", signature.UUID, err)
 	}
 
 	if worker.errorHandler != nil {
 		worker.errorHandler(taskErr)
 	} else {
-		ERROR.Printf("Failed processing task %s. Error = %v", signature.UUID, taskErr)
+		slog.Error("failed processing task", "task", signature.UUID, "error", taskErr)
 	}
 
 	// Trigger error callbacks

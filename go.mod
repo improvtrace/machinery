@@ -3,7 +3,6 @@ module github.com/RichardKnop/machinery
 go 1.22
 
 require (
-	github.com/RichardKnop/logging v0.0.0-20190827224416-1a693bdd4fae
 	github.com/go-redsync/redsync/v4 v4.8.1
 	github.com/google/uuid v1.6.0
 	github.com/opentracing/opentracing-go v1.2.0
