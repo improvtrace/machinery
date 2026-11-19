@@ -202,25 +202,11 @@ type RedisBroker struct {
 	delayedWG            sync.WaitGroup
 	redsync              *redsync.Redsync
 	redisDelayedTasksKey string
-	ownsRClient          bool
 }
 
-// NewRedisBroker creates RedisBroker instance
-func NewRedisBroker(cnf *Config, addrs []string, db int) Broker {
-	b := &RedisBroker{
-		BaseBroker: NewBaseBroker(cnf),
-		rclient:    NewGoRedisClient(cnf, addrs, db),
-	}
-	b.ownsRClient = true
-	if cnf.Redis != nil && cnf.Redis.DelayedTasksKey != "" {
-		b.redisDelayedTasksKey = cnf.Redis.DelayedTasksKey
-	} else {
-		b.redisDelayedTasksKey = defaultRedisDelayedTasksKey
-	}
-	return b
-}
-
-// NewRedisBrokerWithClient creates RedisBroker instance with an external redis.UniversalClient
+// NewRedisBrokerWithClient creates RedisBroker instance with an externally owned
+// redis.UniversalClient. The caller owns the client lifecycle; StopConsuming does
+// not close it.
 func NewRedisBrokerWithClient(cnf *Config, client redis.UniversalClient) Broker {
 	b := &RedisBroker{
 		BaseBroker: NewBaseBroker(cnf),
@@ -335,18 +321,14 @@ func (b *RedisBroker) StartConsuming(consumerTag string, concurrency int, taskPr
 	return b.GetRetry(), nil
 }
 
-// StopConsuming quits the loop
+// StopConsuming quits the loop and waits for consumption goroutines to finish.
+// It does not close the redis client: the caller owns its lifecycle.
 func (b *RedisBroker) StopConsuming() {
 	b.BaseBroker.StopConsuming()
 	// Waiting for the delayed tasks goroutine to have stopped
 	b.delayedWG.Wait()
 	// Waiting for consumption to finish
 	b.consumingWG.Wait()
-
-	if b.ownsRClient {
-		// only close the client if this broker created it
-		b.rclient.Close()
-	}
 }
 
 // Publish places a new message on the default queue

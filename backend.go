@@ -58,17 +58,8 @@ type RedisBackend struct {
 	redsync *redsync.Redsync
 }
 
-// NewRedisBackend creates RedisBackend instance
-func NewRedisBackend(cnf *Config, addrs []string, db int) Backend {
-	b := &RedisBackend{
-		BaseBackend: NewBaseBackend(cnf),
-		rclient:     NewGoRedisClient(cnf, addrs, db),
-	}
-	b.redsync = redsync.New(redsyncgoredis.NewPool(b.rclient))
-	return b
-}
-
-// NewRedisBackendWithClient creates RedisBackend instance with an external redis.UniversalClient
+// NewRedisBackendWithClient creates RedisBackend instance with an externally owned
+// redis.UniversalClient. The caller owns the client lifecycle.
 func NewRedisBackendWithClient(cnf *Config, client redis.UniversalClient) Backend {
 	return &RedisBackend{
 		BaseBackend: NewBaseBackend(cnf),

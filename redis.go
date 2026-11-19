@@ -13,7 +13,9 @@ import (
 	"time"
 )
 
-// NewGoRedisClient creates a redis.UniversalClient from config and addresses.
+// NewGoRedisClient builds a redis.UniversalClient (single node, Sentinel failover
+// or cluster, depending on config) for injection into NewRedisBrokerWithClient,
+// NewRedisBackendWithClient or NewRedisLockWithClient.
 // It parses username/password from the first address if present (format: user:password@host).
 func NewGoRedisClient(cnf *Config, addrs []string, db int) goredis.UniversalClient {
 	if len(addrs) == 0 {

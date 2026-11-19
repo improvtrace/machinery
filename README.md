@@ -40,9 +40,13 @@ func main() {
 		Redis:         &machinery.RedisConfig{NormalTasksPollPeriod: 1000},
 	}
 
-	broker := machinery.NewRedisBroker(cnf, []string{"localhost:6379"}, 0)
-	backend := machinery.NewRedisBackend(cnf, []string{"localhost:6379"}, 0)
-	lock := machinery.NewRedisLock(cnf, []string{"localhost:6379"}, 0, 3)
+	// Build one redis client and inject it into broker, backend and lock.
+	// The caller owns the client lifecycle.
+	client := machinery.NewGoRedisClient(cnf, []string{"localhost:6379"}, 0)
+
+	broker := machinery.NewRedisBrokerWithClient(cnf, client)
+	backend := machinery.NewRedisBackendWithClient(cnf, client)
+	lock := machinery.NewRedisLockWithClient(client, 3)
 
 	server := machinery.NewServer(cnf, broker, backend, lock)
 	server.RegisterTask("add", func(a, b int) (int, error) {
@@ -75,8 +79,10 @@ func main() {
 }
 ```
 
-If you already have a `redis.UniversalClient`, inject it directly with
-`NewRedisBrokerWithClient` / `NewRedisBackendWithClient` / `NewRedisLockWithClient`.
+The broker, backend and lock are always constructed with an externally owned
+`redis.UniversalClient` (build one with `NewGoRedisClient`, or bring your own —
+for example a client that already shares a connection pool with your app).
+The library never closes the injected client.
 
 ## Configuration
 
@@ -104,12 +110,12 @@ Key fields:
 |---|---|
 | `Server` / `NewServer` | Register tasks, send workflows, create workers |
 | `Worker` | `Launch`, `LaunchAsync`, `Quit`, custom handlers (`SetErrorHandler`, `SetPreTaskHandler`, ...) |
-| `NewRedisBroker` / `NewRedisBrokerWithClient` | Redis broker |
-| `NewRedisBackend` / `NewRedisBackendWithClient` | Redis result backend |
+| `NewRedisBrokerWithClient` | Redis broker (externally owned client) |
+| `NewRedisBackendWithClient` | Redis result backend (externally owned client) |
 | `NewRedisLock` / `NewRedisLockWithClient` | Distributed lock used by periodic tasks |
 | `Signature`, `Arg`, `Chain`, `Group`, `Chord` | Task / workflow definitions |
 | `AsyncResult`, `ChainAsyncResult`, `ChordAsyncResult` | Result handles (`Get`, `GetWithTimeout`, `Touch`) |
-| `NewGoRedisClient` | Build a `redis.UniversalClient` from `Config` (single / sentinel / cluster) |
+| `NewGoRedisClient` | Build a `redis.UniversalClient` from `Config` (single / Sentinel / cluster) for injection |
 | `RegisterPeriodicTask/Chain/Group/Chord` | Cron-scheduled workflows (cron spec, guarded by the lock) |
 
 ## Project layout
